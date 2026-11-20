@@ -15,7 +15,7 @@ import { ACCENT, BLUE, GREY, ORANGE, PALETTE, contextTrendSvg, stackSvg, svgSize
 import { groupTools, renderInsights, renderSessionDetail, startInsights } from './insights'
 import { runScan } from './scan'
 import type { PaneInput } from './insights'
-import { bump, fmtTokens, fmtUntil, fmtUsd, paneWidths, pct, programOf, sparkline, textBar, topEntries, windowLabel } from './util'
+import { bump, dropMisfiledLimits, fmtTokens, sessionAccount, fmtUntil, fmtUsd, paneWidths, pct, programOf, sparkline, textBar, topEntries, windowLabel } from './util'
 
 const PLUGIN = 'cc-context-insights'
 const PANE = 'cc-context-insights'
@@ -88,7 +88,8 @@ export const LIMITS_STORE_KEY = 'limits-1'
 /** 记下当前账号这一刻的额度 */
 async function saveLimits($: EngineInterface, windows: RateWindow[], at: number): Promise<void> {
   if (windows.length === 0) return
-  const account = (await read($, accountsAtom)).current
+  const sessionId = await $.session.id().catch(() => undefined)
+  const account = sessionAccount(await read($, accountsAtom), sessionId)
   if (account === undefined) {
     // 账号还没加载完（会话刚开始时扫描尚未跑到 loadAccounts）：只放进本会话状态，
     // 不落到 $.store，免得在兜底键下留一份永远不会被读的旧读数
@@ -97,9 +98,10 @@ async function saveLimits($: EngineInterface, windows: RateWindow[], at: number)
   }
   const stored = ((await $.store.get(LIMITS_STORE_KEY)) ?? {}) as Record<string, RateSnapshot>
   const { current: _stale, ...rest } = stored
-  const next = { ...rest, [account]: { at, windows } }
+  // 同一份读数若还挂在别的账号下（以前认错账号时存的），一并清掉
+  const next = { ...dropMisfiledLimits(rest, account, windows), [account]: { at, windows } }
   await $.store.set(LIMITS_STORE_KEY, next)
-  await update($, limitsAtom, cur => ({ ...cur, ...next }))
+  await update($, limitsAtom, cur => ({ ...dropMisfiledLimits(cur, account, windows), ...next }))
 }
 
 // ---------- 工具调用归类 ----------
@@ -291,7 +293,7 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
     const agents = await $.agent.list().catch(() => [])
     const now = await $.clock.now()
     const allLimits = await read($, limitsAtom)
-    const myAccount = (await read($, accountsAtom)).current
+    const myAccount = sessionAccount(await read($, accountsAtom), await $.session.id().catch(() => undefined))
     // 账号加载前的读数暂记在 'current' 下（只在本会话状态里）
     const mine = myAccount !== undefined ? allLimits[myAccount] : undefined
     const early = allLimits.current

@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { mergeSessions } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
-import { fmtTokens, fmtUntil, programOf } from '../hooks/util'
+import { dropMisfiledLimits, fmtTokens, fmtUntil, programOf, sameAccountWindows, sessionAccount } from '../hooks/util'
 import type { SessionAgg } from '../types'
 
 test('programOf：跳过 sudo/env 等前缀、赋值、注释与子 shell 括号', () => {
@@ -98,4 +98,29 @@ test('当前账号：桌面端登录的账号与 CLI（~/.claude.json）不同�
   // 本会话还没被桌面端记录（如纯 CLI 会话）：退回 ~/.claude.json
   expect((await loadAccounts($, '/h', 'unknown')).current).toBe('acctB')
   expect((await loadAccounts($, '/h')).current).toBe('acctB')
+})
+
+test('额度串号：按会话归属取账号；重置时间一致的旧读数视为存错账号并清掉', () => {
+  const acc = { bySession: { s1: 'acctA' }, labels: {}, current: 'acctB' }
+  // 状态里的 current 过期了，会话归属优先
+  expect(sessionAccount(acc, 's1')).toBe('acctA')
+  expect(sessionAccount(acc, 'other')).toBe('acctB')
+  expect(sessionAccount(acc, undefined)).toBe('acctB')
+
+  const w = (p5: number, r5: string, r7: string) => [
+    { kind: 'five_hour', percentUsed: p5, resetsAt: r5 },
+    { kind: 'seven_day', percentUsed: 2, resetsAt: r7 },
+  ]
+  const live = w(13, '2026-11-20T14:00:00.000Z', '2026-11-25T08:00:00.000Z')
+  // B 名下的旧读数与 A 的实时读数重置时间一致（百分比旧一点）：同一账号
+  expect(sameAccountWindows(w(12, '2026-11-20T14:00:00.000Z', '2026-11-25T08:00:00.000Z'), live)).toBe(true)
+  // 只有一个窗口对上：不足以判断
+  expect(sameAccountWindows(w(12, '2026-11-20T14:00:00.000Z', '2026-11-26T08:00:00.000Z'), live)).toBe(false)
+  expect(sameAccountWindows([live[0]!], [live[0]!])).toBe(false)
+
+  const stored = {
+    acctB: { at: 1, windows: w(12, '2026-11-20T14:00:00.000Z', '2026-11-25T08:00:00.000Z') },
+    acctC: { at: 1, windows: w(50, '2026-11-20T16:00:00.000Z', '2026-11-22T08:00:00.000Z') },
+  }
+  expect(Object.keys(dropMisfiledLimits(stored, 'acctA', live)).sort()).toEqual(['acctC'])
 })

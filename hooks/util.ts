@@ -1,4 +1,5 @@
 // 两个面板共用的格式化与小工具
+import type { AccountMap, RateSnapshot, RateWindow } from '../types'
 
 /** 命令前缀：跳过它们，取后面真正执行的程序 */
 const COMMAND_PREFIXES = new Set(['sudo', 'env', 'command', 'exec', 'time', 'nohup'])
@@ -139,4 +140,38 @@ export function fmtAgo(ms: number): string {
 
 export function escapeXml(s: string): string {
   return s.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c] ?? c)
+}
+
+/**
+ * 本会话属于哪个账号：先查会话归属（桌面端记录），再退回 current。
+ * current 可能是旧代码或旧扫描算出来的（/reload-plugins 不会重新触发会话开始），会话归属更可靠。
+ */
+export function sessionAccount(acc: AccountMap, sessionId: string | undefined): string | undefined {
+  return (sessionId !== undefined ? acc.bySession[sessionId] : undefined) ?? acc.current
+}
+
+/**
+ * 两组额度读数是否出自同一个账号：每个窗口的重置时间都一致（至少两个窗口）。
+ * 重置时间由账号自己的用量决定，不同账号的 5 小时与 7 天窗口同时撞上几乎不可能。
+ */
+export function sameAccountWindows(a: RateWindow[], b: RateWindow[]): boolean {
+  const key = (ws: RateWindow[]) =>
+    ws
+      .filter(w => w.resetsAt)
+      .map(w => `${w.kind}@${w.resetsAt}`)
+      .sort()
+      .join('|')
+  const ka = key(a)
+  return ka.split('|').length >= 2 && ka === key(b)
+}
+
+/** 去掉其他账号名下与这组读数同源的记录（以前把读数存错了账号留下的） */
+export function dropMisfiledLimits(
+  stored: Record<string, RateSnapshot>,
+  account: string,
+  windows: RateWindow[],
+): Record<string, RateSnapshot> {
+  return Object.fromEntries(
+    Object.entries(stored).filter(([k, v]) => k === account || !sameAccountWindows(v.windows, windows)),
+  )
 }

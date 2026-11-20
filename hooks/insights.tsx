@@ -39,6 +39,8 @@ import {
   fmtUsd,
   paneWidths,
   pct,
+  sameAccountWindows,
+  sessionAccount,
   sparkline,
   textBar,
   topEntries,
@@ -436,7 +438,12 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const aggs = await read($, sessionsAtom)
     const scan = await read($, scanAtom)
     const view = await read($, viewAtom)
-    const accounts = await read($, accountsAtom)
+    const storedAccounts = await read($, accountsAtom)
+    // 「当前」以本会话的归属为准（状态里的 current 可能是重新加载插件前算的）
+    const accounts: AccountMap = {
+      ...storedAccounts,
+      current: sessionAccount(storedAccounts, await $.session.id().catch(() => undefined)),
+    }
     const now = await $.clock.now()
     const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
     const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
@@ -503,7 +510,10 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     if (liveWindows.length > 0) limitRows.push({ account: currentId, at: now, windows: liveWindows, isLive: true })
     else if (storedLimits[currentId]) limitRows.push({ ...storedLimits[currentId], account: currentId, isLive: false })
     for (const [k, v] of Object.entries(storedLimits)) {
-      if (k !== currentId && k !== 'current') limitRows.push({ ...v, account: k, isLive: false })
+      if (k === currentId || k === 'current') continue
+      // 与实时读数同源（重置时间完全一致）的，是以前存错账号的同一份数据，不当成别的账号显示
+      if (liveWindows.length > 0 && sameAccountWindows(v.windows, liveWindows)) continue
+      limitRows.push({ ...v, account: k, isLive: false })
     }
     // 「未归属」的会话不属于任何账号，没有额度可显示
     const shownLimits = view.account === undefined ? limitRows : limitRows.filter(r => r.account === view.account)
