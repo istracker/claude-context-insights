@@ -4,6 +4,8 @@ import { contextTrendSvg, dailySvg, svgSize } from '../hooks/charts'
 import { mergeSessions, paginate, projectChips, rankIndex, toolKey } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
 import {
+  billingWeight,
+  cacheReadFactor,
   detectContextDrops,
   dropMisfiledLimits,
   filterFiles,
@@ -221,4 +223,20 @@ test('上下文骤降事件、文件活动筛选与路径截短', () => {
   expect(filterFiles(files, 'write').map(([p]) => p)).toEqual(['/a/b/write-heavy.ts', '/a/b/write-only.ts'])
   expect(shortFilePath('/Users/me/proj/src/index.ts')).toBe('src/index.ts')
   expect(shortFilePath('C:\\Users\\me\\proj\\src\\index.ts')).toBe('src/index.ts')
+})
+
+test('按模型计费权重：Opus/Sonnet 5.5 缓存读 0.05×，4.x/Haiku 0.1×，Fable 0.025×，cw1h>cw 不出负值', () => {
+  expect(cacheReadFactor('claude-opus-5-5')).toBe(0.05)
+  expect(cacheReadFactor('claude-sonnet-5-5-20261001')).toBe(0.05)
+  expect(cacheReadFactor('claude-fable-5-2')).toBe(0.025)
+  expect(cacheReadFactor('claude-haiku-5-5')).toBe(0.1)
+  expect(cacheReadFactor('claude-opus-4-6')).toBe(0.1)
+  expect(cacheReadFactor(undefined)).toBe(0.1)
+
+  // Opus 5.5: 10 + 200*1.25 + 1000*0.05 + 50*5 = 560
+  expect(billingWeight(10, 50, 1000, 200, 0, 'claude-opus-5-5')).toBe(560)
+  // Haiku 5.5: 10 + 200*1.25 + 1000*0.1 + 50*5 = 610
+  expect(billingWeight(10, 50, 1000, 200, 0, 'claude-haiku-5-5')).toBe(610)
+  // 异常数据 cw1h > cw 时不把 5m 写算成负数
+  expect(billingWeight(0, 0, 0, 10, 20, 'claude-opus-5-5')).toBe(40)
 })

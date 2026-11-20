@@ -118,10 +118,10 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
   for (let i = 0; i < 5000 && store.size === 0; i++) await new Promise<void>(r => r())
   for (let i = 0; i < 2000; i++) await new Promise<void>(r => r())
 
-  const agg = store.get('agg3:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
-  // 计费权重：每次请求 10 + 200×1.25 + 1000×0.1 + 50×5 = 610，两次 1220；cost-state 在最后
-  expect(agg.weight).toBe(1220)
-  expect(agg.costAtWeight).toBe(1220)
+  const agg = store.get('agg4:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
+  // Opus 5.5 缓存读 0.05×：每次请求 10 + 200×1.25 + 1000×0.05 + 50×5 = 560，两次 1120；cost-state 在最后
+  expect(agg.weight).toBe(1120)
+  expect(agg.costAtWeight).toBe(1120)
   expect(agg).toBeDefined()
   type Day = { req: number; prompts: number; cr: number; tools: Record<string, number>; skills: Record<string, number>; programs: Record<string, number>; models: Record<string, number>; hours: Record<string, number> }
   const days = agg.days as Record<string, Day>

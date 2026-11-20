@@ -230,6 +230,8 @@ declare module 'claude-code' {
       accounts: Shaped<AccountMap>
       /** 各账号最近一次的额度读数，键为账号 id */
       limits: Shaped<Record<string, RateSnapshot>>
+      /** 本会话最近一次实时拉取的额度（短期缓存，避免高频重渲染重复调 usage） */
+      'live-limits': Shaped<RateSnapshot | null>
       /** 正在查看哪个会话的上下文；null 为洞察总览 */
       focus: Shaped<string | null>
       /** 正在查看的非当前会话的详情 */

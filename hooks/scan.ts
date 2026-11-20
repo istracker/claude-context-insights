@@ -1,5 +1,4 @@
 // 扫描 ~/.claude/projects 下的会话日志，增量汇总到 $.store
-import { atom, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type {
@@ -11,32 +10,16 @@ import type {
   SessionAgg,
   SessionDetail,
 } from '../types'
-import { bump, detectContextDrops, programOf } from './util'
+import { NO_ACCOUNTS, setAccounts, setDetail, setScanState, setSessions } from './state'
+import { addCount, billingWeight, detectContextDrops, programOf } from './util'
 
-// 状态引用与 scan.ts / insights.tsx 共用（同一 plugin+key 指向同一份状态）
-const sessionsAtom = atom({ plugin: 'cc-context-insights', key: 'sessions' } as const, [] as SessionAgg[], {
-  shape: 'sessions-3',
-})
+export { billingWeight }
 
-const IDLE: ScanState = { isRunning: false, doneFiles: 0, totalFiles: 0, doneBytes: 0, totalBytes: 0 }
-const scanAtom = atom({ plugin: 'cc-context-insights', key: 'scan' } as const, IDLE, { shape: 'scan-1' })
-const NO_ACCOUNTS: AccountMap = { bySession: {}, labels: {} }
-const accountsAtom = atom({ plugin: 'cc-context-insights', key: 'accounts' } as const, NO_ACCOUNTS, { shape: 'accounts-1' })
 const LABELS_KEY = 'account-labels-1'
-
-
 const CHUNK = 4 * 1024 * 1024
-const STORE_PREFIX = 'agg3:'
+const STORE_PREFIX = 'agg4:'
 /** 旧版本的缓存前缀，扫描时清掉 */
-const OLD_PREFIXES = ['agg1:', 'agg2:']
-
-/**
- * 计费权重：各类 token 相对「输入」单价的倍数（Claude 标价比例，各模型一致）。
- * 用它把 cost-state 的总成本摊到每天、每类，也用它给还没有 cost-state 的部分估价。
- */
-export function billingWeight(tin: number, tout: number, tcr: number, tcw: number, tcw1h: number): number {
-  return tin + (tcw - tcw1h) * 1.25 + tcw1h * 2 + tcr * 0.1 + tout * 5
-}
+const OLD_PREFIXES = ['agg1:', 'agg2:', 'agg3:']
 const MAP_CAP = 40
 
 export function emptyAgg(id: string, file: string, isSub: boolean): SessionAgg {
@@ -124,10 +107,10 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
       day.cr += tcr
       day.cw += tcw
       day.cw1h += tcw1h
-      agg.weight += billingWeight(tin, tout, tcr, tcw, tcw1h)
+      agg.weight += billingWeight(tin, tout, tcr, tcw, tcw1h, model)
       day.req += 1
-      day.models = bump(day.models, model)
-      day.hours = bump(day.hours, String(hourOf(ts, tzMin)))
+      addCount(day.models, model)
+      addCount(day.hours, String(hourOf(ts, tzMin)))
     }
     if (ts === undefined) return
     const day = dayOf(agg, ts, tzMin)
@@ -136,15 +119,15 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
       const block = obj(raw)
       if (!block || block.type !== 'tool_use') continue
       const name = str(block.name) ?? 'unknown'
-      day.tools = bump(day.tools, name)
+      addCount(day.tools, name)
       const input = obj(block.input)
       if (name === 'Skill') {
         const skill = str(input?.skill)
-        if (skill) day.skills = bump(day.skills, skill)
+        if (skill) addCount(day.skills, skill)
       } else if (name === 'Bash') {
         const cmd = str(input?.command)
         const prog = cmd ? programOf(cmd) : undefined
-        if (prog) day.programs = bump(day.programs, prog)
+        if (prog) addCount(day.programs, prog)
       }
     }
     return
@@ -268,27 +251,56 @@ async function listTargets($: EngineInterface, root: string): Promise<Target[]> 
   return out
 }
 
+/** 桌面端 local_*.json 的内存缓存（仅在文件有有效 mtime 时启用，避免重复串行读盘） */
+const desktopSessionCache = new Map<string, { size: number; mtimeMs: number; ids: string[] }>()
+
 /**
  * 会话 → 账号。Claude Desktop 把每个 Code 会话记在
  * claude-code-sessions/<账号 id>/<组织 id>/local_*.json，其中 cliSessionId 就是日志文件名。
  * 当前登录账号与邮箱来自 ~/.claude.json 的 oauthAccount；见过的邮箱记在 $.store，切换账号后仍能显示。
  */
-export async function loadAccounts($: EngineInterface, home: string, currentSessionId?: string): Promise<AccountMap> {
-  const base = `${home}/Library/Application Support/Claude/claude-code-sessions`
+export async function loadAccounts(
+  $: EngineInterface,
+  home: string,
+  currentSessionId?: string,
+  opts?: { claudeDir?: string; appData?: string },
+): Promise<AccountMap> {
+  const candidates = [
+    `${home}/Library/Application Support/Claude/claude-code-sessions`,
+    ...(opts?.appData ? [`${opts.appData}/Claude/claude-code-sessions`] : []),
+    `${home}/.config/Claude/claude-code-sessions`,
+  ]
+  let base = candidates[0]!
+  let accts = await $.fs.list(base).catch(() => [])
+  for (let i = 1; i < candidates.length && accts.length === 0; i++) {
+    const next = await $.fs.list(candidates[i]!).catch(() => [])
+    if (next.length > 0) {
+      base = candidates[i]!
+      accts = next
+    }
+  }
+
   const bySession: Record<string, string> = {}
-  for (const acct of await $.fs.list(base).catch(() => [])) {
+  for (const acct of accts) {
     if (acct.kind !== 'dir') continue
     for (const org of await $.fs.list(`${base}/${acct.name}`).catch(() => [])) {
       if (org.kind !== 'dir') continue
       const dir = `${base}/${acct.name}/${org.name}`
       for (const f of await $.fs.list(dir).catch(() => [])) {
         if (f.kind !== 'file' || !f.name.endsWith('.json') || f.size > CHUNK) continue
-        const d = parse(await $.fs.read(`${dir}/${f.name}`).catch(() => ''))
-        // 桌面会话回退/重来后会换新的 CLI 会话 id，旧 id 记在 priorCliSessionIds
-        const prior = Array.isArray(d?.priorCliSessionIds) ? d.priorCliSessionIds : []
-        for (const id of [d?.cliSessionId, d?.lastAssistantCliSessionId, ...prior]) {
-          if (typeof id === 'string' && id) bySession[id] = acct.name
+        const filePath = `${dir}/${f.name}`
+        const cached = f.mtimeMs > 0 ? desktopSessionCache.get(filePath) : undefined
+        let ids: string[]
+        if (cached && cached.size === f.size && cached.mtimeMs === f.mtimeMs) {
+          ids = cached.ids
+        } else {
+          const d = parse(await $.fs.read(filePath).catch(() => ''))
+          // 桌面会话回退/重来后会换新的 CLI 会话 id，旧 id 记在 priorCliSessionIds
+          const prior = Array.isArray(d?.priorCliSessionIds) ? d.priorCliSessionIds : []
+          ids = [d?.cliSessionId, d?.lastAssistantCliSessionId, ...prior].filter((id): id is string => typeof id === 'string' && id.length > 0)
+          if (f.mtimeMs > 0) desktopSessionCache.set(filePath, { size: f.size, mtimeMs: f.mtimeMs, ids })
         }
+        for (const id of ids) bySession[id] = acct.name
       }
     }
   }
@@ -315,8 +327,9 @@ export async function loadAccounts($: EngineInterface, home: string, currentSess
       await $.store.set(LABELS_KEY, labels)
     }
   }
-  // 手工别名：~/.claude/cc-context-insights/accounts.json，{ "<账号 id>": "显示名" }，优先级最高
-  const aliases = obj(parse(await $.fs.read(`${home}/.claude/cc-context-insights/accounts.json`).catch(() => '')))
+  // 手工别名：<claudeDir>/cc-context-insights/accounts.json，{ "<账号 id>": "显示名" }，优先级最高
+  const claudeDir = opts?.claudeDir || `${home}/.claude`
+  const aliases = obj(parse(await $.fs.read(`${claudeDir}/cc-context-insights/accounts.json`).catch(() => '')))
   for (const [id, v] of Object.entries(aliases ?? {})) {
     const name = str(v)
     if (name) labels[id] = { ...labels[id], email: name }
@@ -326,9 +339,6 @@ export async function loadAccounts($: EngineInterface, home: string, currentSess
 
 // ---------- 单个会话的上下文详情（双击会话时按需读取） ----------
 
-const detailAtom = atom({ plugin: 'cc-context-insights', key: 'detail' } as const, null as SessionDetail | null, {
-  shape: 'detail-2',
-})
 const DETAIL_POINTS = 400
 const FILE_TOOLS = new Set(['Read', 'NotebookRead', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const WRITE_FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
@@ -373,12 +383,12 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
     programs: {},
     files: {},
   }
-  await update($, detailAtom, () => base)
+  await setDetail($, () => base)
 
   const requests: DetailRequest[] = []
-  let models: Record<string, number> = {}
-  let tools: Record<string, number> = {}
-  let programs: Record<string, number> = {}
+  const models: Record<string, number> = {}
+  const tools: Record<string, number> = {}
+  const programs: Record<string, number> = {}
   const files: Record<string, { r: number; w: number }> = {}
   let lastReq: string | undefined
   const onLine = (line: string) => {
@@ -400,18 +410,18 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
           num(usage.input_tokens) + num(usage.cache_read_input_tokens) + num(usage.cache_creation_input_tokens),
         out: num(usage.output_tokens),
       })
-      models = bump(models, model)
+      addCount(models, model)
     }
     for (const raw of Array.isArray(msg.content) ? msg.content : []) {
       const block = obj(raw)
       if (!block || block.type !== 'tool_use') continue
       const name = str(block.name) ?? 'unknown'
-      tools = bump(tools, name)
+      addCount(tools, name)
       const input = obj(block.input)
       if (name === 'Bash') {
         const cmd = str(input?.command)
         const prog = cmd ? programOf(cmd) : undefined
-        if (prog) programs = bump(programs, prog)
+        if (prog) addCount(programs, prog)
       }
       // NotebookEdit 的路径参数叫 notebook_path
       const path = str(input?.file_path) ?? str(input?.notebook_path)
@@ -446,7 +456,7 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
       }
       for (const line of lines) onLine(line)
       offset += lastNl + 1
-      await update($, detailAtom, d => (d && d.id === id ? { ...d, doneBytes: offset } : d))
+      await setDetail($, d => (d && d.id === id ? { ...d, doneBytes: offset } : d))
     }
     requests.sort((a, b) => a.at - b.at)
     const drops = detectContextDrops(requests)
@@ -465,10 +475,10 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
       programs,
       files,
     }
-    if (token === detailToken) await update($, detailAtom, () => done)
+    if (token === detailToken) await setDetail($, () => done)
   } catch (err) {
     if (token === detailToken) {
-      await update($, detailAtom, d => (d ? { ...d, status: 'error' as const, error: String(err) } : d))
+      await setDetail($, d => (d ? { ...d, status: 'error' as const, error: String(err) } : d))
     }
   }
 }
@@ -479,15 +489,17 @@ let running = false
 export async function runScan($: EngineInterface): Promise<void> {
   if (running) return
   running = true
-  const setScan = (fn: (s: ScanState) => ScanState) => update($, scanAtom, fn)
+  const setScan = (fn: (s: ScanState) => ScanState) => setScanState($, fn)
   try {
-    const home = (await $.env.get('HOME')) ?? ''
-    const root = `${home}/.claude/projects`
+    const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+    const claudeDir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`
+    const appData = await $.env.get('APPDATA')
+    const root = `${claudeDir}/projects`
     const tzMin = await localTzMinutes($)
     const targets = await listTargets($, root)
     const sessionId = await $.session.id().catch(() => undefined)
-    const accounts = await loadAccounts($, home, sessionId).catch(() => NO_ACCOUNTS)
-    await update($, accountsAtom, () => accounts)
+    const accounts = await loadAccounts($, home, sessionId, { claudeDir, appData }).catch(() => NO_ACCOUNTS)
+    await setAccounts($, () => accounts)
 
     // 读出缓存
     const cached = new Map<string, SessionAgg>()
@@ -509,26 +521,35 @@ export async function runScan($: EngineInterface): Promise<void> {
     }
 
     const todo = targets.filter(t => (cached.get(t.file)?.size ?? -1) !== t.size)
-    const totalBytes = todo.reduce((s, t) => s + Math.max(0, t.size - (cached.get(t.file)?.offset ?? 0)), 0)
+    // 文件被截断变小时会从 0 重读，按 t.size 计待读字节，避免进度超过 100%
+    const totalBytes = todo.reduce((s, t) => {
+      const prevOff = cached.get(t.file)?.offset ?? 0
+      return s + (t.size < prevOff ? t.size : t.size - prevOff)
+    }, 0)
     await setScan(() => ({ isRunning: true, doneFiles: 0, totalFiles: todo.length, doneBytes: 0, totalBytes, tzMin }))
-    await update($, sessionsAtom, () => [...cached.values()])
+    await setSessions($, () => [...cached.values()])
 
     let done = 0
+    let doneBytes = 0
     for (const t of todo) {
       const agg = cached.get(t.file) ?? emptyAgg(t.id, t.file, t.isSub)
       await scanFile($, agg, t.size, tzMin, async n => {
-        await setScan(s => ({ ...s, doneBytes: s.doneBytes + n }))
+        doneBytes += n
+        // 大文件分块读时实时推进进度条，小文件随批次统一刷，减少重渲染风暴
+        if (t.size > CHUNK) await setScan(s => ({ ...s, doneBytes }))
       })
       cached.set(t.file, agg)
       await $.store.set(STORE_PREFIX + t.file, agg)
       done += 1
-      await setScan(s => ({ ...s, doneFiles: done }))
-      // 每处理几个文件刷一次面板
-      if (done % 5 === 0 || done === todo.length) await update($, sessionsAtom, () => [...cached.values()])
+      // 每处理 5 个文件刷一次进度与会话列表
+      if (done % 5 === 0 || done === todo.length) {
+        await setScan(s => ({ ...s, doneFiles: done, doneBytes }))
+        await setSessions($, () => [...cached.values()])
+      }
     }
-    await update($, sessionsAtom, () => [...cached.values()])
+    await setSessions($, () => [...cached.values()])
     const now = await $.clock.now()
-    await setScan(s => ({ ...s, isRunning: false, finishedAt: now }))
+    await setScan(s => ({ ...s, isRunning: false, doneFiles: done, doneBytes, finishedAt: now }))
   } catch (err) {
     await setScan(s => ({ ...s, isRunning: false, error: String(err) }))
   } finally {

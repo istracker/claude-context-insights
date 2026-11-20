@@ -1,5 +1,6 @@
 {
   "name": "cc-context-insights-local",
+  "description": "cc-context-insights 上下文洞察插件的本地与 GitHub 分发清单",
   "owner": { "name": "Lcp" },
   "plugins": [
     {

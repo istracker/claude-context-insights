@@ -1,5 +1,4 @@
 // 跨会话洞察：汇总 ~/.claude/projects 下所有会话的用量、成本与活动
-import { atom, read, update } from 'claude-code'
 import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type {
@@ -12,11 +11,23 @@ import type {
   RankKind,
   RateSnapshot,
   RateWindow,
-  ScanState,
-  SessionDetail,
   SessionAgg,
 } from '../types'
 import { dayKey, loadSessionDetail, runScan } from './scan'
+import {
+  COMMAND,
+  getAccounts,
+  getDetail,
+  getLimits,
+  getScan,
+  getSessions,
+  getView,
+  LIMITS_STORE_KEY,
+  readLiveLimits,
+  setFocus,
+  setLimits,
+  setViewState,
+} from './state'
 import {
   ACCENT,
   AMBER,
@@ -37,7 +48,8 @@ import {
 } from './charts'
 import type { DayPoint, HeatDay } from './charts'
 import {
-  bump,
+  addCount,
+  cacheReadFactor,
   cardStyle,
   filterFiles,
   fmtAgo,
@@ -57,34 +69,6 @@ import {
   windowLabel,
 } from './util'
 
-// 状态引用与 scan.ts 共用（同一 plugin+key 指向同一份状态）
-const sessionsAtom = atom({ plugin: 'cc-context-insights', key: 'sessions' } as const, [] as SessionAgg[], {
-  shape: 'sessions-3',
-})
-const IDLE: ScanState = { isRunning: false, doneFiles: 0, totalFiles: 0, doneBytes: 0, totalBytes: 0 }
-const scanAtom = atom({ plugin: 'cc-context-insights', key: 'scan' } as const, IDLE, { shape: 'scan-1' })
-// 会话默认按时间排；改了默认值就换 shape，让旧会话里存的「按成本」失效
-const DEFAULT_VIEW: InsightView = { range: '7d', sort: 'recent' }
-const viewAtom = atom({ plugin: 'cc-context-insights', key: 'view' } as const, DEFAULT_VIEW, { shape: 'view-2' })
-const NO_ACCOUNTS: AccountMap = { bySession: {}, labels: {} }
-const accountsAtom = atom({ plugin: 'cc-context-insights', key: 'accounts' } as const, NO_ACCOUNTS, { shape: 'accounts-1' })
-const limitsAtom = atom({ plugin: 'cc-context-insights', key: 'limits' } as const, {} as Record<string, RateSnapshot>, {
-  shape: 'limits-1',
-})
-/** 与 register.tsx 的 LIMITS_STORE_KEY 相同 */
-const LIMITS_STORE_KEY = 'limits-1'
-
-// 洞察已并入「上下文」面板，作为其中一个标签页
-const PANE = 'cc-context-insights'
-const TITLE = '上下文洞察'
-// 与 register.tsx / scan.ts 共用
-const focusAtom = atom({ plugin: 'cc-context-insights', key: 'focus' } as const, null as string | null, {
-  shape: 'focus-1',
-})
-const detailAtom = atom({ plugin: 'cc-context-insights', key: 'detail' } as const, null as SessionDetail | null, {
-  shape: 'detail-2',
-})
-
 // ---------- 双击会话 ----------
 // 按钮事件不带点击次数，自己判断：同一会话在 DOUBLE_MS 内按两次算双击
 const DOUBLE_MS = 450
@@ -97,8 +81,8 @@ async function pressSession($: EngineInterface, id: string, file: string | undef
   const isDouble = lastPress !== undefined && lastPress.id === id && now - lastPress.at <= DOUBLE_MS
   lastPress = isDouble ? undefined : { id, at: now }
   if (!isDouble) return
-  await update($, viewAtom, v => ({ ...v, fileFilter: undefined, showAllFiles: false }))
-  await update($, focusAtom, () => id)
+  await setViewState($, v => ({ ...v, fileFilter: undefined, showAllFiles: false }))
+  await setFocus($, () => id)
   const current = await $.session.id().catch(() => undefined)
   if (id !== current && file) {
     requestedDetail = id
@@ -107,7 +91,6 @@ async function pressSession($: EngineInterface, id: string, file: string | undef
 }
 /** 「上下文」面板里渲染函数的输入 */
 export type PaneInput = RenderInput<'Pane'>
-const COMMAND = 'ctx-insights'
 const DAY_MS = 86_400_000
 
 
@@ -122,21 +105,22 @@ const PARTS: { key: Part; name: string; color: string }[] = [
 ]
 
 /**
- * 各类 token 相对「输入」单价的倍数（Claude 标价比例，各模型一致）：
- * 5 分钟缓存写 1.25、1 小时缓存写 2、缓存读 0.1、输出 5。
+ * 各类 token 相对「输入」单价的倍数：
+ * 5 分钟缓存写 1.25×、1 小时缓存写 2×、缓存读按模型（Opus/Sonnet 5.5 为 0.05×，4.x/Haiku 为 0.1×）、输出 5×。
  * 用来把会话总成本（cost-state）摊到每一天、每一类。
  */
-export function partWeights(d: DayAgg): Record<Part, number> {
+export function partWeights(d: DayAgg, model?: string): Record<Part, number> {
+  const m = model ?? topEntries(d.models, 1)[0]?.[0]
   return {
     in: d.in,
-    cw: (d.cw - d.cw1h) * 1.25 + d.cw1h * 2,
-    cr: d.cr * 0.1,
+    cw: Math.max(0, d.cw - d.cw1h) * 1.25 + d.cw1h * 2,
+    cr: d.cr * cacheReadFactor(m),
     out: d.out * 5,
   }
 }
 
-function weight(d: DayAgg): number {
-  const w = partWeights(d)
+function weight(d: DayAgg, model?: string): number {
+  const w = partWeights(d, model)
   return w.in + w.cw + w.cr + w.out
 }
 
@@ -163,13 +147,26 @@ export type MergedSession = {
 }
 
 function mergeMap(a: Record<string, number>, b: Record<string, number>): Record<string, number> {
-  let out = a
-  for (const [k, v] of Object.entries(b)) out = bump(out, k, v)
+  const out: Record<string, number> = { ...a }
+  for (const [k, v] of Object.entries(b)) addCount(out, k, v)
   return out
 }
 
+function mergeMapInPlace(target: Record<string, number>, b: Record<string, number>): void {
+  for (const [k, v] of Object.entries(b)) addCount(target, k, v)
+}
+
 function mergeDay(a: DayAgg | undefined, b: DayAgg): DayAgg {
-  if (!a) return { ...b }
+  if (!a) {
+    return {
+      ...b,
+      models: { ...b.models },
+      tools: { ...b.tools },
+      skills: { ...b.skills },
+      programs: { ...b.programs },
+      hours: { ...b.hours },
+    }
+  }
   return {
     in: a.in + b.in,
     out: a.out + b.out,
@@ -194,7 +191,11 @@ function mergeDay(a: DayAgg | undefined, b: DayAgg): DayAgg {
  */
 export function mergeSessions(aggs: SessionAgg[]): MergedSession[] {
   const byId = new Map<string, SessionAgg[]>()
-  for (const a of aggs) byId.set(a.id, [...(byId.get(a.id) ?? []), a])
+  for (const a of aggs) {
+    const list = byId.get(a.id)
+    if (list) list.push(a)
+    else byId.set(a.id, [a])
+  }
 
   type Group = { id: string; main: SessionAgg; days: Record<string, DayAgg>; lastAt: number; model: string; subW: number }
   const groups: Group[] = []
@@ -209,8 +210,8 @@ export function mergeSessions(aggs: SessionAgg[]): MergedSession[] {
       lastAt = Math.max(lastAt, p.lastAt ?? 0)
       if (p !== main) subW += p.weight ?? 0
     }
-    let models: Record<string, number> = {}
-    for (const d of Object.values(days)) models = mergeMap(models, d.models)
+    const models: Record<string, number> = {}
+    for (const d of Object.values(days)) mergeMapInPlace(models, d.models)
     const model = topEntries(models, 1)[0]?.[0] ?? 'unknown'
     groups.push({ id, main, days, lastAt, model, subW })
   }
@@ -252,16 +253,16 @@ export function mergeSessions(aggs: SessionAgg[]): MergedSession[] {
       cost = (main.weight + subW) * rate
       isEstimated = cost > 0
     }
-    const totalW = Object.values(days).reduce((s, d) => s + weight(d), 0)
+    const totalW = Object.values(days).reduce((s, d) => s + weight(d, model), 0)
     const dayUsd: Record<string, number> = {}
     if (cost !== undefined && totalW > 0) {
-      for (const [k, d] of Object.entries(days)) dayUsd[k] = (cost * weight(d)) / totalW
+      for (const [k, d] of Object.entries(days)) dayUsd[k] = (cost * weight(d, model)) / totalW
     }
     const cwd = main.cwd
     out.push({
       id,
       title: main.title ?? main.lastPrompt ?? id.slice(0, 8),
-      project: cwd ? (cwd.split('/').filter(Boolean).slice(-1)[0] ?? cwd) : '未知项目',
+      project: cwd ? (cwd.split(/[/\\]/).filter(Boolean).slice(-1)[0] ?? cwd) : '未知项目',
       lastAt,
       costUsd: cost,
       isEstimated,
@@ -346,11 +347,11 @@ export function addSession(t: Totals, s: MergedSession, days: Set<string> | unde
       target.prompts += d.prompts
       target.usd += usd
     }
-    t.models = mergeMap(t.models, d.models)
-    t.tools = mergeMap(t.tools, d.tools)
-    t.skills = mergeMap(t.skills, d.skills)
-    t.programs = mergeMap(t.programs, d.programs)
-    t.hours = mergeMap(t.hours, d.hours)
+    mergeMapInPlace(t.models, d.models)
+    mergeMapInPlace(t.tools, d.tools)
+    mergeMapInPlace(t.skills, d.skills)
+    mergeMapInPlace(t.programs, d.programs)
+    mergeMapInPlace(t.hours, d.hours)
   }
   return own
 }
@@ -362,10 +363,10 @@ export function serverLabel(server: string): string {
 }
 
 export function groupTools(tools: Record<string, number>): Record<string, number> {
-  let out: Record<string, number> = {}
+  const out: Record<string, number> = {}
   for (const [name, n] of Object.entries(tools)) {
     const m = /^mcp__(.+?)__/.exec(name)
-    out = bump(out, m ? `${serverLabel(m[1] ?? '')}（MCP）` : name, n)
+    addCount(out, m ? `${serverLabel(m[1] ?? '')}（MCP）` : name, n)
   }
   return out
 }
@@ -515,7 +516,7 @@ const SORTS: [InsightSort, string][] = [
 const PART_HINT: Record<Part, string> = {
   cw: '上下文变化后要重新写入缓存，单价是输入的 1.25～2 倍',
   out: '模型生成的回复与工具调用参数，单价最高',
-  cr: '复用已缓存的上下文，单价只有输入的十分之一',
+  cr: '复用已缓存的上下文，单价仅为输入的 1/20～1/10',
   in: '没有命中缓存的输入',
 }
 const ACCOUNT_COLORS = PALETTE
@@ -536,7 +537,7 @@ export async function startInsights($: EngineInterface): Promise<void> {
   // 各账号上次的额度读数存在 $.store（跨会话），载入到本会话状态
   const stored = (await $.store.get(LIMITS_STORE_KEY)) as Record<string, RateSnapshot> | undefined
   // 与 refresh 并发：已有的（更新的）读数优先，旧读数只补缺
-  if (stored && typeof stored === 'object') await update($, limitsAtom, cur => ({ ...stored, ...cur }))
+  if (stored && typeof stored === 'object') await setLimits($, cur => ({ ...stored, ...cur }))
   void runScan($)
 }
 
@@ -565,10 +566,10 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         />
       )
     }
-    const aggs = await read($, sessionsAtom)
-    const scan = await read($, scanAtom)
-    const view = await read($, viewAtom)
-    const storedAccounts = await read($, accountsAtom)
+    const aggs = await getSessions($)
+    const scan = await getScan($)
+    const view = await getView($)
+    const storedAccounts = await getAccounts($)
     const currentSessionId = await $.session.id().catch(() => undefined)
     // 「当前」以本会话的归属为准（状态里的 current 可能是重新加载插件前算的）
     const accounts: AccountMap = {
@@ -578,7 +579,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const now = await $.clock.now()
     const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
     const today = dayKey(now, tzMin)
-    const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
+    const setView = (fn: (v: InsightView) => InsightView) => void setViewState($, fn)
     const { full, half } = paneWidths(e.props.bodyColumns)
 
     // ----- 数据 -----
@@ -618,22 +619,22 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       prevTokens !== undefined && prevTokens > 100_000 ? (tokensOf(total) - prevTokens) / prevTokens : undefined
 
     const byAccount = new Map<string, number>()
-    for (const s of all) {
-      const r = addSession(emptyTotals(), s, days)
-      if (r.usd <= 0) continue
-      const k = s.account ?? 'none'
-      byAccount.set(k, (byAccount.get(k) ?? 0) + r.usd)
+    if (view.account === undefined) {
+      for (const s of all) {
+        let usd = 0
+        for (const [k, v] of Object.entries(s.dayUsd)) {
+          if (!days || days.has(k)) usd += v
+        }
+        if (usd <= 0) continue
+        const k = s.account ?? 'none'
+        byAccount.set(k, (byAccount.get(k) ?? 0) + usd)
+      }
     }
     const accountTotal = [...byAccount.values()].reduce((a, b) => a + b, 0)
 
-    // 订阅额度：当前账号取实时读数，其他账号取切换前存下的最后读数
-    const storedLimits = await read($, limitsAtom)
-    const live = await $.session.usage().catch(() => undefined)
-    const liveWindows: RateWindow[] = (live?.rateLimits ?? []).map(r => ({
-      kind: r.kind,
-      percentUsed: r.percentUsed,
-      resetsAt: r.resetsAt,
-    }))
+    // 订阅额度：当前账号取实时读数（短期缓存避免高频重渲染重复 RPC），其他账号取切换前存下的最后读数
+    const storedLimits = await getLimits($)
+    const liveWindows = await readLiveLimits($, now)
     const currentId = accounts.current ?? 'current'
     type LimitRow = RateSnapshot & { account: string; isLive: boolean }
     const limitRows: LimitRow[] = []
@@ -1413,16 +1414,16 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
   const { Box, Text, Button } = els
   const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
   const card = cardStyle(e.surface)
-  const aggs = await read($, sessionsAtom)
-  const accounts = await read($, accountsAtom)
-  const detail = await read($, detailAtom)
-  const scan = await read($, scanAtom)
-  const view = await read($, viewAtom)
+  const aggs = await getSessions($)
+  const accounts = await getAccounts($)
+  const detail = await getDetail($)
+  const scan = await getScan($)
+  const view = await getView($)
   const now = await $.clock.now()
   const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
   const cols = e.props.bodyColumns
   const { full } = paneWidths(cols)
-  const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
+  const setView = (fn: (v: InsightView) => InsightView) => void setViewState($, fn)
 
   const all = mergeSessions(aggs)
   const s = all.find(x => x.id === id)

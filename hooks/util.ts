@@ -42,13 +42,49 @@ export function programOf(command: string): string | undefined {
     }
     const head = words[0]
     if (head === undefined || head === 'cd') continue
-    return head.replace(/^.*\//, '')
+    return head.replace(/^.*[/\\]/, '')
   }
   return undefined
 }
 
 export function bump(map: Record<string, number>, key: string, by = 1): Record<string, number> {
   return { ...map, [key]: (map[key] ?? 0) + by }
+}
+
+/** 就地累加计数，用于日志扫描与汇总热循环，避免反复浅拷贝整个对象 */
+export function addCount(map: Record<string, number>, key: string, by = 1): void {
+  map[key] = (map[key] ?? 0) + by
+}
+
+/**
+ * 缓存读取相对「输入」单价的倍数：
+ * - Claude Opus 5.5 / Sonnet 5.5：0.05×（$0.20/$4.00、$0.10/$2.00）
+ * - Claude Fable 5.2：0.025×（$0.20/$8.00）
+ * - Claude 4.x 与 Haiku 系列：0.1×
+ */
+export function cacheReadFactor(model: string | undefined): number {
+  if (!model) return 0.1
+  const m = model.toLowerCase()
+  if (m.includes('fable')) return 0.025
+  if ((m.includes('opus-5') || m.includes('sonnet-5')) && !m.includes('haiku')) return 0.05
+  return 0.1
+}
+
+/**
+ * 计费权重：各类 token 相对「输入」单价的倍数
+ * （5 分钟缓存写 1.25×、1 小时缓存写 2×、缓存读按模型 0.05×/0.1×、输出 5×）。
+ * 用它把 cost-state 的总成本摊到每天、每类，也用它给还没有 cost-state 的部分估价。
+ */
+export function billingWeight(
+  tin: number,
+  tout: number,
+  tcr: number,
+  tcw: number,
+  tcw1h: number,
+  model?: string,
+): number {
+  const cw5m = Math.max(0, tcw - tcw1h)
+  return tin + cw5m * 1.25 + tcw1h * 2 + tcr * cacheReadFactor(model) + tout * 5
 }
 
 export function fmtTokens(n: number | undefined): string {

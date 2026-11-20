@@ -1,23 +1,47 @@
-import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type {
-  AccountMap,
   Activity,
   CategoryRow,
   FileFilter,
   InsightView,
   RateSnapshot,
   RateWindow,
-  ScanState,
   Snapshot,
   StepRecord,
-  StepTotals,
 } from '../types'
 import { ACCENT, BLUE, GREY, ORANGE, PALETTE, contextTrendSvg, stackSvg, svgSize } from './charts'
 import { groupTools, renderInsights, renderSessionDetail, startInsights } from './insights'
 import { cancelSessionDetail, runScan } from './scan'
 import type { PaneInput } from './insights'
+import {
+  getAccounts,
+  getActivity,
+  getBusy,
+  getFocus,
+  getLimits,
+  getScan,
+  getSnapshot,
+  getSteps,
+  getStepTotals,
+  getTurns,
+  getView,
+  LIMITS_STORE_KEY,
+  MAX_STEPS,
+  noteLiveLimits,
+  PANE,
+  PLUGIN,
+  setActivity,
+  setBusy,
+  setFocus,
+  setLimits,
+  setSnapshot,
+  setSteps,
+  setStepTotals,
+  setTurns,
+  setViewState,
+  TITLE,
+} from './state'
 import {
   bump,
   cardStyle,
@@ -39,18 +63,10 @@ import {
   windowLabel,
 } from './util'
 
-const PLUGIN = 'cc-context-insights'
-const PANE = 'cc-context-insights'
-const TITLE = '上下文洞察'
-const MAX_STEPS = 300
-
-// 面板默认是洞察总览；在会话列表里双击某个会话，就切到那个会话的上下文（focus = 会话 id）
-const focusAtom = atom({ plugin: 'cc-context-insights', key: 'focus' } as const, null as string | null, {
-  shape: 'focus-1',
-})
+export { LIMITS_STORE_KEY }
 
 async function renderMain($: EngineInterface, e: PaneInput): Promise<JSX.Element> {
-  const focus = await read($, focusAtom)
+  const focus = await getFocus($)
   if (focus === null) return renderInsights($, e)
   const { Box, Button, Text } = $.ui.resolve(e)
   const currentId = await $.session.id().catch(() => undefined)
@@ -67,7 +83,7 @@ async function renderMain($: EngineInterface, e: PaneInput): Promise<JSX.Element
           dimColor
           onPress={() => {
             cancelSessionDetail()
-            void update($, focusAtom, () => null)
+            void setFocus($, () => null)
           }}
         />
         {isCurrent ? (
@@ -81,54 +97,16 @@ async function renderMain($: EngineInterface, e: PaneInput): Promise<JSX.Element
   )
 }
 
-// 字段变了就改 shape：旧版本存下的值会被丢弃，而不是读成错的形状
-const steps = atom({ plugin: 'cc-context-insights', key: 'steps' } as const, [] as StepRecord[], {
-  shape: 'steps-1',
-})
-/** 整个会话的请求累计：steps 只留最近 MAX_STEPS 条画趋势，统计数字不能跟着截断 */
-const NO_TOTALS: StepTotals = { count: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-const stepTotals = atom({ plugin: 'cc-context-insights', key: 'step-totals' } as const, NO_TOTALS, {
-  shape: 'step-totals-1',
-})
-const turns = atom({ plugin: 'cc-context-insights', key: 'turns' } as const, 0, { shape: 'turns-1' })
-const EMPTY_ACTIVITY: Activity = {
-  tools: {},
-  errors: 0,
-  reads: 0,
-  writes: 0,
-  searches: 0,
-  files: {},
-  programs: {},
-}
-const activity = atom({ plugin: 'cc-context-insights', key: 'activity' } as const, EMPTY_ACTIVITY, {
-  shape: 'activity-1',
-})
-const snapshot = atom({ plugin: 'cc-context-insights', key: 'snapshot' } as const, null as Snapshot | null, {
-  shape: 'snapshot-1',
-})
-const busy = atom({ plugin: 'cc-context-insights', key: 'busy' } as const, false, { shape: 'busy-1' })
-// 与 insights.tsx / scan.ts 共用
-const NO_ACCOUNTS: AccountMap = { bySession: {}, labels: {} }
-const accountsAtom = atom({ plugin: 'cc-context-insights', key: 'accounts' } as const, NO_ACCOUNTS, { shape: 'accounts-1' })
-const limitsAtom = atom({ plugin: 'cc-context-insights', key: 'limits' } as const, {} as Record<string, RateSnapshot>, {
-  shape: 'limits-1',
-})
-const IDLE_SCAN: ScanState = { isRunning: false, doneFiles: 0, totalFiles: 0, doneBytes: 0, totalBytes: 0 }
-const scanAtom = atom({ plugin: 'cc-context-insights', key: 'scan' } as const, IDLE_SCAN, { shape: 'scan-1' })
-const DEFAULT_VIEW: InsightView = { range: '7d', sort: 'recent' }
-const viewAtom = atom({ plugin: 'cc-context-insights', key: 'view' } as const, DEFAULT_VIEW, { shape: 'view-2' })
-/** 额度快照跨会话保存（$.state 只活在本会话），切换账号后另一个账号的最后读数仍可显示 */
-export const LIMITS_STORE_KEY = 'limits-1'
-
 /** 记下当前账号这一刻的额度 */
 async function saveLimits($: EngineInterface, windows: RateWindow[], at: number): Promise<void> {
+  await noteLiveLimits($, windows, at)
   if (windows.length === 0) return
   const sessionId = await $.session.id().catch(() => undefined)
-  const account = sessionAccount(await read($, accountsAtom), sessionId)
+  const account = sessionAccount(await getAccounts($), sessionId)
   if (account === undefined) {
     // 账号还没加载完（会话刚开始时扫描尚未跑到 loadAccounts）：只放进本会话状态，
     // 不落到 $.store，免得在兜底键下留一份永远不会被读的旧读数
-    await update($, limitsAtom, cur => ({ ...cur, current: { at, windows } }))
+    await setLimits($, cur => ({ ...cur, current: { at, windows } }))
     return
   }
   const stored = ((await $.store.get(LIMITS_STORE_KEY)) ?? {}) as Record<string, RateSnapshot>
@@ -136,7 +114,7 @@ async function saveLimits($: EngineInterface, windows: RateWindow[], at: number)
   // 同一份读数若还挂在别的账号下（以前认错账号时存的），一并清掉
   const next = { ...dropMisfiledLimits(rest, account, windows), [account]: { at, windows } }
   await $.store.set(LIMITS_STORE_KEY, next)
-  await update($, limitsAtom, cur => {
+  await setLimits($, cur => {
     const { current: _early, ...curRest } = cur
     return { ...dropMisfiledLimits(curRest, account, windows), ...next }
   })
@@ -157,13 +135,13 @@ let pendingFull = false
 let refreshing = false
 
 async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<void> {
-  if (refreshing || (await read($, busy))) {
+  if (refreshing || (await getBusy($))) {
     if (detail === 'full') pendingFull = true
     return
   }
   refreshing = true
   if (detail === 'full') pendingFull = false
-  await update($, busy, () => true)
+  await setBusy($, () => true)
   try {
     const usage = await $.session.usage({ breakdown: detail })
     const b = usage.context.breakdown
@@ -188,7 +166,7 @@ async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<
       mcpTools: b?.mcpTools.length ?? 0,
       skills: b?.skills?.totalSkills ?? 0,
     }
-    await update($, snapshot, () => next)
+    await setSnapshot($, () => next)
     await saveLimits(
       $,
       usage.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })),
@@ -198,7 +176,7 @@ async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<
     $.ui.log(`${PLUGIN}: 刷新失败 ${String(err)}`)
   } finally {
     refreshing = false
-    await update($, busy, () => false)
+    await setBusy($, () => false)
     if (pendingFull) {
       pendingFull = false
       void refresh($, 'full')
@@ -218,7 +196,7 @@ export const register: Register = on => {
   on('command.run', { command: 'ctx-insights' }, async ($, e) => {
     const isFull = e.args.trim() === 'full'
     const currentId = isFull ? await $.session.id().catch(() => null) : null
-    await update($, focusAtom, () => currentId)
+    await setFocus($, () => currentId)
     const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true }).catch(() => undefined)
     void runScan($)
     void refresh($, isFull ? 'full' : 'summary')
@@ -257,8 +235,8 @@ export const register: Register = on => {
         model: u.model,
         tools: result.toolUses.length,
       }
-      await update($, steps, list => [...list, rec].slice(-MAX_STEPS))
-      await update($, stepTotals, t => ({
+      await setSteps($, list => [...list, rec].slice(-MAX_STEPS))
+      await setStepTotals($, t => ({
         count: t.count + 1,
         input: t.input + rec.input,
         output: t.output + rec.output,
@@ -273,7 +251,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId === undefined) {
-      await update($, turns, n => n + 1)
+      await setTurns($, n => n + 1)
       void refresh($, 'summary')
     }
     return result
@@ -293,7 +271,7 @@ export const register: Register = on => {
     const command = typeof args.command === 'string' ? args.command : undefined
     const ran = await next(e)
     // 统计失败不能影响工具结果
-    await update($, activity, a => {
+    await setActivity($, a => {
       const out: Activity = { ...a, tools: bump(a.tools, name) }
       if (ran.isError === true || ran.deny !== undefined) out.errors = a.errors + 1
       if (READ_TOOLS.has(name)) out.reads = a.reads + 1
@@ -313,8 +291,8 @@ export const register: Register = on => {
     return ran
   })
 
-  // 「上下文洞察」面板：默认总览，双击会话进入它的上下文
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => renderMain($, e))
+  // 「上下文洞察」面板：默认总览，双击会话进入它的上下文（匹配器用字面量供校验器静态识别）
+  on('ui.render', { component: 'Pane', requestId: 'cc-context-insights' }, async ($, e) => renderMain($, e))
 }
 
 /** 「本会话」标签页的内容：窗口占用、构成、趋势、本会话统计、活动、子 Agent */
@@ -339,28 +317,28 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
         />
       )
     }
-    const snap = await read($, snapshot)
-    const list = await read($, steps)
-    const turnCount = await read($, turns)
-    const act = await read($, activity)
-    const isBusy = await read($, busy)
+    const snap = await getSnapshot($)
+    const list = await getSteps($)
+    const turnCount = await getTurns($)
+    const act = await getActivity($)
+    const isBusy = await getBusy($)
     const agents = await $.agent.list().catch(() => [])
     const now = await $.clock.now()
-    const allLimits = await read($, limitsAtom)
-    const myAccount = sessionAccount(await read($, accountsAtom), await $.session.id().catch(() => undefined))
+    const allLimits = await getLimits($)
+    const myAccount = sessionAccount(await getAccounts($), await $.session.id().catch(() => undefined))
     // 账号加载前的读数暂记在 'current' 下（只在本会话状态里）
     const mine = myAccount !== undefined ? allLimits[myAccount] : undefined
     const early = allLimits.current
     const myLimits = mine && early ? (early.at > mine.at ? early : mine) : (mine ?? early)
     const cols = e.props.bodyColumns
     const { full } = paneWidths(cols)
-    const scan = await read($, scanAtom)
-    const view = await read($, viewAtom)
+    const scan = await getScan($)
+    const view = await getView($)
     const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
-    const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
+    const setView = (fn: (v: InsightView) => InsightView) => void setViewState($, fn)
 
     // ----- 数据 -----
-    const sum = await read($, stepTotals)
+    const sum = await getStepTotals($)
     const prompted = sum.input + sum.cacheRead + sum.cacheWrite
     const last = list[list.length - 1]
     const prev = list[list.length - 2]
