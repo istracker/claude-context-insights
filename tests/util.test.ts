@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { contextTrendSvg, dailySvg, svgSize } from '../hooks/charts'
-import { mergeSessions, rankIndex, toolKey } from '../hooks/insights'
+import { mergeSessions, paginate, projectChips, rankIndex, toolKey } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
 import {
   dropMisfiledLimits,
@@ -167,4 +167,28 @@ test('排行：次数、最近日期、用过它的会话；未估价项目不�
   expect(fmtDayAgo('2026-11-20', '2026-11-20')).toBe('今天')
   expect(fmtDayAgo('2026-11-19', '2026-11-20')).toBe('昨天')
   expect(fmtDayAgo('2026-11-15', '2026-11-20')).toBe('5 天前')
+})
+
+test('项目分组胶囊与分页：按会话数排序、保留已选中冷门项、页码越界自动钳制', () => {
+  const mk = (project: string, usd: number) => ({ project, r: { usd } })
+  const list = [mk('b', 1), mk('a', 5), mk('b', 2), mk('c', 10), mk('d', 0.1)]
+  // 按会话数降序（b=2），同数按成本降序（c=10 > a=5 > d=0.1）
+  expect(projectChips(list, undefined, 2)).toEqual([
+    { name: 'b', count: 2 },
+    { name: 'c', count: 1 },
+  ])
+  // 已选中项不在前 limit 个中时补在末尾，确保可清除
+  expect(projectChips(list, 'd', 2)).toEqual([
+    { name: 'b', count: 2 },
+    { name: 'c', count: 1 },
+    { name: 'd', count: 1 },
+  ])
+
+  const items = [1, 2, 3, 4, 5, 6, 7, 8]
+  expect(paginate(items, 0, 6)).toEqual({ page: 0, totalPages: 2, slice: [1, 2, 3, 4, 5, 6] })
+  expect(paginate(items, 1, 6)).toEqual({ page: 1, totalPages: 2, slice: [7, 8] })
+  // 越界页码自动收敛到末页 / 首页
+  expect(paginate(items, 99, 6)).toEqual({ page: 1, totalPages: 2, slice: [7, 8] })
+  expect(paginate(items, -3, 6)).toEqual({ page: 0, totalPages: 2, slice: [1, 2, 3, 4, 5, 6] })
+  expect(paginate([], 2, 6)).toEqual({ page: 0, totalPages: 1, slice: [] })
 })

@@ -166,8 +166,10 @@ export type InsightView = {
   day?: string
   /** 工具排行是否展开 MCP 明细 */
   expandMcp?: boolean
-  /** 会话列表是否显示全部 */
-  showAllSessions?: boolean
+  /** 会话列表当前页（从 0 开始） */
+  page?: number
+  /** 会话列表按项目分组筛选 */
+  project?: string
   /** 是否展开「更多」：项目、时段、工具、命令等 */
   showActivity?: boolean
   /** 账号筛选：账号 id，'none' 为未归属；不填为全部 */

@@ -416,6 +416,41 @@ export function rankIndex(
   return out
 }
 
+/** 会话列表按项目分组胶囊：按会话数降序（同数按成本降序），取前 limit 个；若已选中项不在前 limit 个中则补上 */
+export function projectChips(
+  sessions: { project: string; r: { usd: number } }[],
+  selected?: string,
+  limit = 8,
+): { name: string; count: number }[] {
+  const byProj = new Map<string, { count: number; usd: number }>()
+  for (const s of sessions) {
+    const cur = byProj.get(s.project) ?? { count: 0, usd: 0 }
+    cur.count += 1
+    cur.usd += s.r.usd
+    byProj.set(s.project, cur)
+  }
+  const ranked = [...byProj.entries()]
+    .sort((a, b) => b[1].count - a[1].count || b[1].usd - a[1].usd || a[0].localeCompare(b[0]))
+    .map(([name, v]) => ({ name, count: v.count }))
+  const top = ranked.slice(0, limit)
+  if (selected !== undefined && !top.some(p => p.name === selected)) {
+    const hit = ranked.find(p => p.name === selected) ?? { name: selected, count: 0 }
+    top.push(hit)
+  }
+  return top
+}
+
+/** 轻量分页：自动把页码钳在合法范围，避免筛选或扫描后越界 */
+export function paginate<T>(items: T[], rawPage: number | undefined, pageSize: number): {
+  page: number
+  totalPages: number
+  slice: T[]
+} {
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize))
+  const page = Math.max(0, Math.min(rawPage ?? 0, totalPages - 1))
+  return { page, totalPages, slice: items.slice(page * pageSize, (page + 1) * pageSize) }
+}
+
 /** 账号显示名：邮箱，没见过就用 id 前 4 位 */
 export function accountLabel(acc: AccountMap, id: string | undefined): string {
   if (id === undefined) return '未归属'
@@ -594,16 +629,20 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const topPart = parts[0]
     const hourVals = Array.from({ length: 24 }, (_, i) => total.hours[String(i)] ?? 0)
     const busiest = hourVals.indexOf(Math.max(...hourVals))
-    // 排行：次数、最近用到的日期与用过它的会话；点选一项后会话列表只列用过它的会话
+    // 排行：次数、最近用到的日期与用过它的会话；点选一项后下方会话列表只列符合条件的会话
     const ranks = rankIndex(active, days, view.expandMcp ?? false)
-    const pickedIds = view.pick ? (ranks[view.pick.kind].get(view.pick.key)?.ids ?? new Set<string>()) : undefined
+    // 兼容旧状态：项目筛选统一归入 activeProject，其余排行（工具/命令/技能/模型）归入 activePick，两者可叠加
+    const activeProject = view.project ?? (view.pick?.kind === 'proj' ? view.pick.key : undefined)
+    const activePick = view.pick && view.pick.kind !== 'proj' ? view.pick : undefined
+    const pickedIds = activePick ? (ranks[activePick.kind].get(activePick.key)?.ids ?? new Set<string>()) : undefined
     const sorted = [...active]
-      .filter(s => pickedIds === undefined || pickedIds.has(s.id))
+      .filter(s => (activeProject === undefined || s.project === activeProject) && (pickedIds === undefined || pickedIds.has(s.id)))
       .sort((a, b) => (view.sort === 'cost' ? b.r.usd - a.r.usd : b.lastAt - a.lastAt))
     /** 会话 id → 主日志文件（双击后从它还原上下文） */
     const mainFiles = new Map(aggs.filter(a => !a.isSub).map(a => [a.id, a.file] as const))
-    const SESSIONS_MAX = 40
-    const shownSessions = view.showAllSessions ? sorted.slice(0, SESSIONS_MAX) : sorted.slice(0, 6)
+    const PAGE_SIZE = 6
+    const { page, totalPages, slice: shownSessions } = paginate(sorted, view.page, PAGE_SIZE)
+    const projChips = projectChips(active, activeProject)
 
     // ----- 小组件 -----
     /** 区块卡片：标题 · 旁注 ··· 右上角关键数字 · 操作 */
@@ -703,7 +742,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       </Box>
     )
     /**
-     * 排行：「名称 · 数值 · 最近一次」，下面一条细进度线；点一项筛选上方的会话，再点取消。
+     * 排行：「名称 · 数值 · 最近一次」，下面一条细进度线；点一项筛选下方的会话，再点取消。
      * 默认 RANK_VISIBLE 行，可展开到 RANK_MAX 行。
      */
     const rankList = (kind: RankKind, fmt: (v: number) => string, width = half) => {
@@ -711,11 +750,12 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       if (rows.length === 0) return <Text dimColor>暂无</Text>
       const isOpen = view.openRanks?.includes(kind) ?? false
       const max = rows[0]?.[1].value ?? 1
-      const pickedHere = view.pick?.kind === kind
+      const isProj = kind === 'proj'
+      const pickedHere = isProj ? activeProject !== undefined : activePick?.kind === kind
       return (
         <Box flexDirection="column" gap={1}>
           {rows.slice(0, isOpen ? RANK_MAX : RANK_VISIBLE).map(([k, it], i) => {
-            const isPicked = pickedHere && view.pick?.key === k
+            const isPicked = isProj ? activeProject === k : pickedHere && activePick?.key === k
             return (
               <Box key={`rk-${kind}-${k}`} flexDirection="column">
                 <Box flexDirection="row" alignItems="center" columnGap={2}>
@@ -724,7 +764,18 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                       key={`pick-${kind}-${k}`}
                       plain
                       dimColor={pickedHere && !isPicked}
-                      onPress={() => setView(v => ({ ...v, pick: isPicked ? undefined : { kind, key: k } }))}
+                      onPress={() =>
+                        setView(v =>
+                          isProj
+                            ? {
+                                ...v,
+                                project: isPicked ? undefined : k,
+                                pick: v.pick?.kind === 'proj' ? undefined : v.pick,
+                                page: 0,
+                              }
+                            : { ...v, pick: isPicked ? undefined : { kind, key: k }, page: 0 },
+                        )
+                      }
                     >
                       <Text wrap="truncate-end" color={isPicked ? ACCENT : undefined} weight={isPicked ? 'semibold' : 'regular'}>
                         {isPicked ? `✓ ${k}` : k}
@@ -866,7 +917,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                 key={`range-${r}`}
                 label={label}
                 variant={view.range === r ? 'primary' : 'secondary'}
-                onPress={() => setView(v => ({ ...v, range: r }))}
+                onPress={() => setView(v => ({ ...v, range: r, page: 0 }))}
               />
             ))}
           </Box>
@@ -876,7 +927,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                 key="account"
                 options={accountOptions}
                 value={view.account ?? 'all'}
-                onSelect={value => setView(v => ({ ...v, account: value === 'all' ? undefined : value }))}
+                onSelect={value => setView(v => ({ ...v, account: value === 'all' ? undefined : value, page: 0 }))}
               />
             ) : null}
             <Button
@@ -930,15 +981,99 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           ) : null}
         </Box>
 
+        {/* 排行与分布（默认折叠）：放在会话正上方，点选一项后下方会话即时筛选 */}
+        <Box flexDirection="column" gap={2}>
+          <Button
+            key="toggle-activity"
+            label={view.showActivity ? '▾ 更多' : '▸ 更多：项目、时段、工具、命令、技能、模型'}
+            plain
+            onPress={() => setView(v => ({ ...v, showActivity: !v.showActivity }))}
+          />
+          {view.showActivity ? (
+            <Text dimColor size="footnote">
+              点排行里的一项，下方「会话」只列出用过它的会话；再点一次取消。「最近」按天记录，精确到当天。
+            </Text>
+          ) : null}
+          {view.showActivity ? (
+            <Box flexDirection="column" gap={4}>
+              {/* 项目 + 时段 */}
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
+                <Box flexDirection="column" flexGrow={1} minWidth={30}>
+                  <Section title="项目" note="按成本" stat={ranks.proj.size > 0 ? `${ranks.proj.size} 个` : undefined}>
+                    {rankList('proj', v => fmtUsd(v))}
+                  </Section>
+                </Box>
+                <Box flexDirection="column" flexGrow={1} minWidth={30}>
+                  <Section title="时段" stat={total.req > 0 ? `最忙 ${busiest}:00–${busiest + 1}:00` : undefined}>
+                    {Svg ? (
+                      <Chart source={hoursSvg(total.hours, half)} alt="按小时的请求分布" isInteractive />
+                    ) : (
+                      <Text color={ACCENT}>{sparkline(hourVals, Math.max(1, ...hourVals))}</Text>
+                    )}
+                  </Section>
+                </Box>
+              </Box>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
+                <Box flexDirection="column" flexGrow={1} minWidth={30}>
+                  <Section
+                    title="工具调用"
+                    stat={rankStat('tool', '次')}
+                    right={
+                      <Button
+                        key="toggle-mcp"
+                        label={view.expandMcp ? '合并 MCP' : '展开 MCP'}
+                        plain
+                        dimColor
+                        onPress={() =>
+                          setView(v => ({
+                            ...v,
+                            expandMcp: !v.expandMcp,
+                            // 合并/展开后工具名变了，原来点选的工具对不上
+                            pick: v.pick?.kind === 'tool' ? undefined : v.pick,
+                            page: v.pick?.kind === 'tool' ? 0 : v.page,
+                          }))
+                        }
+                      />
+                    }
+                  >
+                    {rankList('tool', count)}
+                  </Section>
+                </Box>
+                <Box flexDirection="column" flexGrow={1} minWidth={30}>
+                  <Section title="命令" stat={rankStat('prog', '次')}>
+                    {rankList('prog', count)}
+                  </Section>
+                </Box>
+              </Box>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
+                <Box flexDirection="column" flexGrow={1} minWidth={30}>
+                  <Section title="技能" stat={rankStat('skill', '次')}>
+                    {rankList('skill', count)}
+                  </Section>
+                </Box>
+                <Box flexDirection="column" flexGrow={1} minWidth={30}>
+                  <Section title="模型" note="按请求数" stat={rankStat('model', '次')}>
+                    {rankList('model', count)}
+                  </Section>
+                </Box>
+              </Box>
+            </Box>
+          ) : null}
+        </Box>
+
         {/* 会话 */}
         <Section
           title="会话"
           note={
-            view.pick
-              ? `${sorted.length} 个用过${RANK_NOUN[view.pick.kind]}「${view.pick.key}」`
-              : active.length > 0
-                ? `${active.length} 个 · 双击查看会话的上下文`
-                : undefined
+            activeProject && activePick
+              ? `${sorted.length} 个 · 项目「${activeProject}」且用过${RANK_NOUN[activePick.kind]}「${activePick.key}」`
+              : activePick
+                ? `${sorted.length} 个用过${RANK_NOUN[activePick.kind]}「${activePick.key}」`
+                : activeProject
+                  ? `${sorted.length} 个 · 项目「${activeProject}」· 双击查看上下文`
+                  : active.length > 0
+                    ? `${active.length} 个 · 双击查看会话的上下文`
+                    : undefined
           }
           right={
             <Box flexDirection="row" columnGap={1}>
@@ -948,25 +1083,58 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                   label={label}
                   plain
                   dimColor={view.sort !== s}
-                  onPress={() => setView(v => ({ ...v, sort: s }))}
+                  onPress={() => setView(v => ({ ...v, sort: s, page: 0 }))}
                 />
               ))}
             </Box>
           }
         >
-          {view.pick ? (
+          {/* 项目分组胶囊：至少两个项目或已选中项目时显示，与「项目」排行联动 */}
+          {projChips.length >= 2 || activeProject !== undefined ? (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
+              <Button
+                key="proj-all"
+                label={`全部 ${active.length}`}
+                variant={activeProject === undefined ? 'primary' : 'secondary'}
+                onPress={() =>
+                  setView(v => ({
+                    ...v,
+                    project: undefined,
+                    pick: v.pick?.kind === 'proj' ? undefined : v.pick,
+                    page: 0,
+                  }))
+                }
+              />
+              {projChips.map(p => (
+                <Button
+                  key={`proj-${p.name}`}
+                  label={`${p.name} ${p.count}`}
+                  variant={activeProject === p.name ? 'primary' : 'secondary'}
+                  onPress={() =>
+                    setView(v => ({
+                      ...v,
+                      project: activeProject === p.name ? undefined : p.name,
+                      pick: v.pick?.kind === 'proj' ? undefined : v.pick,
+                      page: 0,
+                    }))
+                  }
+                />
+              ))}
+            </Box>
+          ) : null}
+          {activePick ? (
             <Button
               key="clear-pick"
-              label={`✕ 清除筛选（${RANK_NOUN[view.pick.kind]}：${view.pick.key}）`}
+              label={`✕ 清除筛选（${RANK_NOUN[activePick.kind]}：${activePick.key}）`}
               plain
               dimColor
-              onPress={() => setView(v => ({ ...v, pick: undefined }))}
+              onPress={() => setView(v => ({ ...v, pick: undefined, page: 0 }))}
             />
           ) : null}
           {active.length === 0 ? (
             <Text dimColor>{scan.isRunning ? '正在扫描…' : '这段时间没有会话。'}</Text>
-          ) : view.pick && sorted.length === 0 ? (
-            <Text dimColor>这段时间没有用过它的会话。</Text>
+          ) : (activeProject !== undefined || activePick !== undefined) && sorted.length === 0 ? (
+            <Text dimColor>这段时间没有符合筛选条件的会话。</Text>
           ) : null}
           <Box flexDirection="column" gap={1}>
             {shownSessions.map(s => (
@@ -1007,22 +1175,30 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               </Box>
             ))}
           </Box>
-          {sorted.length > 6 ? (
-            <Button
-              key="more-sessions"
-              label={
-                view.showAllSessions
-                  ? sorted.length > SESSIONS_MAX
-                    ? `收起（已显示前 ${SESSIONS_MAX} 个，共 ${sorted.length} 个）`
-                    : '收起'
-                  : sorted.length > SESSIONS_MAX
-                    ? `显示前 ${SESSIONS_MAX} 个（共 ${sorted.length} 个）`
-                    : `显示全部 ${sorted.length} 个`
-              }
-              plain
-              dimColor
-              onPress={() => setView(v => ({ ...v, showAllSessions: !v.showAllSessions }))}
-            />
+          {totalPages > 1 ? (
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
+              <Button
+                key="page-prev"
+                label="‹ 上一页"
+                plain
+                dimColor={page === 0}
+                onPress={() => {
+                  if (page > 0) setView(v => ({ ...v, page: page - 1 }))
+                }}
+              />
+              <Text dimColor size="footnote" tabular>
+                第 {page + 1} / {totalPages} 页 · 共 {sorted.length} 个
+              </Text>
+              <Button
+                key="page-next"
+                label="下一页 ›"
+                plain
+                dimColor={page >= totalPages - 1}
+                onPress={() => {
+                  if (page < totalPages - 1) setView(v => ({ ...v, page: page + 1 }))
+                }}
+              />
+            </Box>
           ) : null}
         </Section>
 
@@ -1108,85 +1284,6 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
             </Box>
           </Section>
         ) : null}
-
-        {/* 更多（默认折叠）：项目、时段与活动明细 */}
-        <Box flexDirection="column" gap={2}>
-          <Button
-            key="toggle-activity"
-            label={view.showActivity ? '▾ 更多' : '▸ 更多：项目、时段、工具、命令、技能、模型'}
-            plain
-            onPress={() => setView(v => ({ ...v, showActivity: !v.showActivity }))}
-          />
-          {view.showActivity ? (
-            <Text dimColor size="footnote">
-              点排行里的一项，上方「会话」只列出用过它的会话；再点一次取消。「最近」按天记录，精确到当天。
-            </Text>
-          ) : null}
-          {view.showActivity ? (
-            <Box flexDirection="column" gap={4}>
-              {/* 项目 + 时段 */}
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="项目" note="按成本" stat={ranks.proj.size > 0 ? `${ranks.proj.size} 个` : undefined}>
-                    {rankList('proj', v => fmtUsd(v))}
-                  </Section>
-                </Box>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="时段" stat={total.req > 0 ? `最忙 ${busiest}:00–${busiest + 1}:00` : undefined}>
-                    {Svg ? (
-                      <Chart source={hoursSvg(total.hours, half)} alt="按小时的请求分布" isInteractive />
-                    ) : (
-                      <Text color={ACCENT}>{sparkline(hourVals, Math.max(1, ...hourVals))}</Text>
-                    )}
-                  </Section>
-                </Box>
-              </Box>
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section
-                    title="工具调用"
-                    stat={rankStat('tool', '次')}
-                    right={
-                      <Button
-                        key="toggle-mcp"
-                        label={view.expandMcp ? '合并 MCP' : '展开 MCP'}
-                        plain
-                        dimColor
-                        onPress={() =>
-                          setView(v => ({
-                            ...v,
-                            expandMcp: !v.expandMcp,
-                            // 合并/展开后工具名变了，原来点选的工具对不上
-                            pick: v.pick?.kind === 'tool' ? undefined : v.pick,
-                          }))
-                        }
-                      />
-                    }
-                  >
-                    {rankList('tool', count)}
-                  </Section>
-                </Box>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="命令" stat={rankStat('prog', '次')}>
-                    {rankList('prog', count)}
-                  </Section>
-                </Box>
-              </Box>
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="技能" stat={rankStat('skill', '次')}>
-                    {rankList('skill', count)}
-                  </Section>
-                </Box>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="模型" note="按请求数" stat={rankStat('model', '次')}>
-                    {rankList('model', count)}
-                  </Section>
-                </Box>
-              </Box>
-            </Box>
-          ) : null}
-        </Box>
 
         <Text dimColor size="caption">
           等价 API 成本＝这些用量按 API 标价折算的价值；订阅用户不按它计费，真正的上限看订阅额度。
