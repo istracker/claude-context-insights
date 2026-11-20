@@ -66,7 +66,7 @@ test('活跃度汇总：按天累加、近 30 天活跃天数与连续活跃天�
     a.costAtWeight = 100
     a.lastAt = 1
     for (const k of days) {
-      a.days[k] = { in: 100, out: 0, cr: 0, cw: 0, cw1h: 0, req: 1, prompts: 1, models: { m: 1 }, tools: {}, skills: {}, programs: {}, hours: {} }
+      a.days[k] = { in: 100, out: 0, cr: 0, cw: 0, cw1h: 0, req: 1, prompts: 1, models: { m: 1 }, tools: {}, skills: {} }
     }
     return a
   }

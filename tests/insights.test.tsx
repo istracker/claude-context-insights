@@ -118,12 +118,21 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
   for (let i = 0; i < 5000 && store.size === 0; i++) await new Promise<void>(r => r())
   for (let i = 0; i < 2000; i++) await new Promise<void>(r => r())
 
-  const agg = store.get('agg4:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
+  const agg = store.get('agg5:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
   // Opus 5.5 缓存读 0.05×：每次请求 10 + 200×1.25 + 1000×0.05 + 50×5 = 560，两次 1120；cost-state 在最后
   expect(agg.weight).toBe(1120)
   expect(agg.costAtWeight).toBe(1120)
   expect(agg).toBeDefined()
-  type Day = { req: number; prompts: number; cr: number; tools: Record<string, number>; skills: Record<string, number>; programs: Record<string, number>; models: Record<string, number>; hours: Record<string, number> }
+  type Day = {
+    req: number
+    prompts: number
+    cr: number
+    tools: Record<string, number>
+    toolTokens?: Record<string, number>
+    skills: Record<string, number>
+    models: Record<string, number>
+    modelWeight?: Record<string, number>
+  }
   const days = agg.days as Record<string, Day>
   const day = Object.values(days)[0]
   expect(day?.req).toBe(2) // r1 三行只算一次 + r2
@@ -132,10 +141,10 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
   expect(agg.costUsd).toBe(1.5)
   expect(agg.title).toBe('测试会话标题')
   expect(day?.tools.Bash).toBe(1)
+  expect(day?.toolTokens?.Bash).toBeGreaterThan(0)
   expect(day?.skills.tdd).toBe(1)
-  expect(day?.programs.git).toBe(1)
   expect(day?.models['claude-opus-5-5']).toBe(2)
-  expect(Object.values(day?.hours ?? {}).reduce((a, b) => a + b, 0)).toBe(2) // 两次请求落在同一小时
+  expect(day?.modelWeight?.['claude-opus-5-5']).toBe(1120)
   expect(agg.offset).toBe(SIZE)
   expect((store.get('account-labels-1') as Record<string, { email?: string }>).acctA?.email).toBe('a@x.com')
 

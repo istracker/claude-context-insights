@@ -18,6 +18,7 @@ import {
   COMMAND,
   getAccounts,
   getDetail,
+  getInstalledSkills,
   getLimits,
   getScan,
   getSessions,
@@ -41,7 +42,6 @@ import {
   dailySvg,
   donutSvg,
   heatmapSvg,
-  hoursSvg,
   lineSvg,
   stackSvg,
   svgSize,
@@ -161,10 +161,10 @@ function mergeDay(a: DayAgg | undefined, b: DayAgg): DayAgg {
     return {
       ...b,
       models: { ...b.models },
+      modelWeight: b.modelWeight ? { ...b.modelWeight } : {},
       tools: { ...b.tools },
+      toolTokens: b.toolTokens ? { ...b.toolTokens } : {},
       skills: { ...b.skills },
-      programs: { ...b.programs },
-      hours: { ...b.hours },
     }
   }
   return {
@@ -176,10 +176,10 @@ function mergeDay(a: DayAgg | undefined, b: DayAgg): DayAgg {
     req: a.req + b.req,
     prompts: a.prompts + b.prompts,
     models: mergeMap(a.models, b.models),
+    modelWeight: mergeMap(a.modelWeight ?? {}, b.modelWeight ?? {}),
     tools: mergeMap(a.tools, b.tools),
+    toolTokens: mergeMap(a.toolTokens ?? {}, b.toolTokens ?? {}),
     skills: mergeMap(a.skills, b.skills),
-    programs: mergeMap(a.programs, b.programs),
-    hours: mergeMap(a.hours, b.hours),
   }
 }
 
@@ -302,9 +302,8 @@ export type Totals = {
   usdBy: Record<Part, number>
   models: Record<string, number>
   tools: Record<string, number>
+  toolTokens: Record<string, number>
   skills: Record<string, number>
-  programs: Record<string, number>
-  hours: Record<string, number>
 }
 
 export function emptyTotals(): Totals {
@@ -319,9 +318,8 @@ export function emptyTotals(): Totals {
     usdBy: { in: 0, cw: 0, cr: 0, out: 0 },
     models: {},
     tools: {},
+    toolTokens: {},
     skills: {},
-    programs: {},
-    hours: {},
   }
 }
 
@@ -349,9 +347,8 @@ export function addSession(t: Totals, s: MergedSession, days: Set<string> | unde
     }
     mergeMapInPlace(t.models, d.models)
     mergeMapInPlace(t.tools, d.tools)
+    mergeMapInPlace(t.toolTokens, d.toolTokens ?? {})
     mergeMapInPlace(t.skills, d.skills)
-    mergeMapInPlace(t.programs, d.programs)
-    mergeMapInPlace(t.hours, d.hours)
   }
   return own
 }
@@ -383,12 +380,11 @@ export function toolKey(name: string, expandMcp: boolean): string {
   return m ? `${serverLabel(m[1] ?? '')}（MCP）` : name
 }
 
-/** 排行的一项：数值、最近用到的日期（YYYY-MM-DD）、用过它的会话 */
-export type RankItem = { value: number; lastDay: string; ids: Set<string> }
+/** 排行的一项：主排序值（成本 / 估算 token / 次数）、副计数（请求数 / 调用次数）、最近日期（YYYY-MM-DD）、用过它的会话 */
+export type RankItem = { value: number; subCount: number; lastDay: string; ids: Set<string> }
 
 /**
- * 把会话在这段时间里的项目、工具、命令、技能、模型汇总成排行。
- * 日志只按天记次数，所以「最近」精确到当天（YYYY-MM-DD）。
+ * 把会话在这段时间里的项目（按成本）、模型（按成本）、工具（按上下文估算 token）、技能（按次数）汇总成 2×2 决策排行。
  */
 export function rankIndex(
   sessions: MergedSession[],
@@ -397,14 +393,14 @@ export function rankIndex(
 ): Record<RankKind, Map<string, RankItem>> {
   const out: Record<RankKind, Map<string, RankItem>> = {
     proj: new Map(),
-    tool: new Map(),
-    prog: new Map(),
-    skill: new Map(),
     model: new Map(),
+    tool: new Map(),
+    skill: new Map(),
   }
-  const add = (kind: RankKind, key: string, value: number, day: string, id: string) => {
-    const it = out[kind].get(key) ?? { value: 0, lastDay: '', ids: new Set<string>() }
+  const add = (kind: RankKind, key: string, value: number, subCount: number, day: string, id: string) => {
+    const it = out[kind].get(key) ?? { value: 0, subCount: 0, lastDay: '', ids: new Set<string>() }
     it.value += value
+    it.subCount += subCount
     if (day > it.lastDay) it.lastDay = day
     it.ids.add(id)
     out[kind].set(key, it)
@@ -412,13 +408,33 @@ export function rankIndex(
   for (const s of sessions) {
     for (const [k, d] of Object.entries(s.days)) {
       if (days && !days.has(k)) continue
-      // 项目按成本排行：只有产生费用的才计入，避免抬头项目数与列表「暂无」不一致
+      // 1. 项目按成本排行：只有产生费用的才计入，避免抬头项目数与列表「暂无」不一致
       const usd = s.dayUsd[k] ?? 0
-      if (usd > 0) add('proj', s.project, usd, k, s.id)
-      for (const [name, n] of Object.entries(d.tools)) if (n > 0) add('tool', toolKey(name, expandMcp), n, k, s.id)
-      for (const [name, n] of Object.entries(d.programs)) if (n > 0) add('prog', name, n, k, s.id)
-      for (const [name, n] of Object.entries(d.skills)) if (n > 0) add('skill', name, n, k, s.id)
-      for (const [name, n] of Object.entries(d.models)) if (n > 0) add('model', name, n, k, s.id)
+      if (usd > 0) add('proj', s.project, usd, d.req, k, s.id)
+
+      // 2. 模型按成本排行：按当天各模型的计费权重（无权重时退回请求数占比）分摊当天成本
+      const mwMap = d.modelWeight ?? {}
+      const sumMw = Object.values(mwMap).reduce((a, b) => a + b, 0)
+      const sumReq = Object.values(d.models).reduce((a, b) => a + b, 0)
+      for (const [m, reqs] of Object.entries(d.models)) {
+        if (reqs <= 0) continue
+        const mw = mwMap[m] ?? 0
+        const share = sumMw > 0 ? mw / sumMw : sumReq > 0 ? reqs / sumReq : 0
+        const mUsd = usd * share
+        // 若整个会话未估价（usd=0），退回用请求数作为微弱正值，保证已用模型仍可见
+        add('model', m, mUsd > 0 ? mUsd : reqs * 1e-9, reqs, k, s.id)
+      }
+
+      // 3. 工具按往上下文塞入的估算 token 排行（副计数保留调用次数）
+      const tokMap = d.toolTokens ?? {}
+      for (const [name, calls] of Object.entries(d.tools)) {
+        if (calls <= 0) continue
+        const tok = tokMap[name] ?? calls
+        add('tool', toolKey(name, expandMcp), tok, calls, k, s.id)
+      }
+
+      // 4. 技能按调用次数排行
+      for (const [name, n] of Object.entries(d.skills)) if (n > 0) add('skill', name, n, n, k, s.id)
     }
   }
   return out
@@ -524,7 +540,7 @@ const ACCOUNT_COLORS = PALETTE
 const RANK_VISIBLE = 6
 const RANK_MAX = 20
 /** 排行点选的对象在会话筛选提示里怎么称呼 */
-const RANK_NOUN: Record<RankKind, string> = { proj: '项目', tool: '工具', prog: '命令', skill: '技能', model: '模型' }
+const RANK_NOUN: Record<RankKind, string> = { proj: '项目', model: '模型', tool: '工具', skill: '技能' }
 
 // ---------- 注册 ----------
 
@@ -570,6 +586,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const scan = await getScan($)
     const view = await getView($)
     const storedAccounts = await getAccounts($)
+    const installedSkills = await getInstalledSkills($)
     const currentSessionId = await $.session.id().catch(() => undefined)
     // 「当前」以本会话的归属为准（状态里的 current 可能是重新加载插件前算的）
     const accounts: AccountMap = {
@@ -667,14 +684,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
 
     const parts = [...PARTS].sort((a, b) => total.usdBy[b.key] - total.usdBy[a.key])
     const topPart = parts[0]
-    const hourVals = Array.from({ length: 24 }, (_, i) => total.hours[String(i)] ?? 0)
-    const busiest = hourVals.indexOf(Math.max(...hourVals))
-    // 排行：次数、最近用到的日期与用过它的会话；点选一项后下方会话列表只列符合条件的会话
+    // 2×2 决策排行：项目（按成本）、模型（按成本）、工具（按上下文估算 token）、技能（按次数 + 已装未用）
     const ranks = rankIndex(active, days, view.expandMcp ?? false)
-    // 兼容旧状态：项目筛选统一归入 activeProject，其余排行（工具/命令/技能/模型）归入 activePick，两者可叠加
+    // 兼容旧状态：项目筛选统一归入 activeProject，其余排行（模型/工具/技能）归入 activePick，两者可叠加
     const activeProject = view.project ?? (view.pick?.kind === 'proj' ? view.pick.key : undefined)
-    const activePick = view.pick && view.pick.kind !== 'proj' ? view.pick : undefined
-    const pickedIds = activePick ? (ranks[activePick.kind].get(activePick.key)?.ids ?? new Set<string>()) : undefined
+    const activePick =
+      view.pick && view.pick.kind !== 'proj' && (view.pick.kind as string) !== 'prog' ? view.pick : undefined
+    const pickedIds = activePick ? (ranks[activePick.kind]?.get(activePick.key)?.ids ?? new Set<string>()) : undefined
     const sorted = [...active]
       .filter(s => (activeProject === undefined || s.project === activeProject) && (pickedIds === undefined || pickedIds.has(s.id)))
       .sort((a, b) => (view.sort === 'cost' ? b.r.usd - a.r.usd : b.lastAt - a.lastAt))
@@ -789,10 +805,15 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       </Box>
     )
     /**
-     * 排行：「名称 · 数值 · 最近一次」，下面一条细进度线；点一项筛选下方的会话，再点取消。
+     * 排行：「名称 · 主数值 · [副信息]」，下面一条细进度线；点一项筛选下方的会话，再点取消。
      * 默认 RANK_VISIBLE 行，可展开到 RANK_MAX 行。
      */
-    const rankList = (kind: RankKind, fmt: (v: number) => string, width = half) => {
+    const rankList = (
+      kind: RankKind,
+      fmt: (v: number) => string,
+      extraCol?: (it: RankItem) => string | undefined,
+      width = half,
+    ) => {
       const rows = [...ranks[kind].entries()].filter(([, it]) => it.value > 0).sort((a, b) => b[1].value - a[1].value)
       if (rows.length === 0) return <Text dimColor>暂无</Text>
       const isOpen = view.openRanks?.includes(kind) ?? false
@@ -803,6 +824,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         <Box flexDirection="column" gap={1}>
           {rows.slice(0, isOpen ? RANK_MAX : RANK_VISIBLE).map(([k, it], i) => {
             const isPicked = isProj ? activeProject === k : pickedHere && activePick?.key === k
+            const extra = extraCol?.(it)
             return (
               <Box key={`rk-${kind}-${k}`} flexDirection="column">
                 <Box flexDirection="row" alignItems="center" columnGap={2}>
@@ -831,11 +853,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                   </Box>
                   {Svg ? null : <Text color={ACCENT}>{textBar((it.value / max) * 100, 6)}</Text>}
                   <Text tabular>{fmt(it.value)}</Text>
-                  <Box minWidth={9} justifyContent="flex-end">
-                    <Text dimColor size="footnote" tabular>
-                      {fmtDayAgo(it.lastDay, today)}
-                    </Text>
-                  </Box>
+                  {extra !== undefined ? (
+                    <Box minWidth={8} justifyContent="flex-end">
+                      <Text dimColor size="footnote" tabular>
+                        {extra}
+                      </Text>
+                    </Box>
+                  ) : null}
                 </Box>
                 {Svg ? (
                   <Svg
@@ -872,11 +896,6 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           ) : null}
         </Box>
       )
-    }
-    /** 排行标题右上角：合计 */
-    const rankStat = (kind: RankKind, unit: string) => {
-      const sum = [...ranks[kind].values()].reduce((a, it) => a + it.value, 0)
-      return sum > 0 ? `${ranks[kind].size} 项 · ${sum} ${unit}` : undefined
     }
     /** 一个额度窗口：名称 · 条 · 已用 · 重置时间 */
     const quotaRow = (key: string, w: RateWindow) => {
@@ -920,7 +939,10 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     }
     const count = (v: number) => `×${v}`
     const toolCalls = Object.values(total.tools).reduce((a, n) => a + n, 0)
-    const commandRuns = Object.values(total.programs).reduce((a, n) => a + n, 0)
+    const toolTotalTokens = [...ranks.tool.values()].reduce((a, it) => a + it.value, 0)
+    const modelTotalUsd = total.usd > 0 ? [...ranks.model.values()].reduce((a, it) => a + it.value, 0) : 0
+    const skillTotalCalls = [...ranks.skill.values()].reduce((a, it) => a + it.value, 0)
+    const unusedSkills = installedSkills.filter(s => !ranks.skill.has(s))
     const pctDone = scan.totalBytes > 0 ? Math.round((scan.doneBytes / scan.totalBytes) * 100) : 100
 
     const accountOptions = [
@@ -948,7 +970,12 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         total.prompts > 0 ? fmtUsd(total.usd / total.prompts) : '—',
         total.prompts > 0 ? { text: `${fmtTokens(Math.round(tokensOf(total) / total.prompts))} token` } : { text: '暂无提问' },
       ),
-      kpi('kpi-tools', '工具调用', String(toolCalls), { text: `命令执行 ${commandRuns} 次` }),
+      kpi(
+        'kpi-tools',
+        '工具调用',
+        String(toolCalls),
+        { text: toolTotalTokens > 0 ? `占上下文约 ${fmtTokens(toolTotalTokens)}` : `${ranks.tool.size} 种工具` },
+      ),
     ]
     const kpiRows: JSX.Element[][] = []
     for (let i = 0; i < kpiItems.length; i += kpiCols) kpiRows.push(kpiItems.slice(i, i + kpiCols))
@@ -1141,43 +1168,49 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           ) : null}
         </Box>
 
-        {/* 排行与分布（默认折叠）：放在会话正上方，点选一项后下方会话即时筛选 */}
+        {/* 2×2 决策排行（默认折叠）：只保留能改变用法的 4 项——项目、模型、工具上下文、技能 */}
         <Box flexDirection="column" gap={2}>
           <Button
             key="toggle-activity"
-            label={view.showActivity ? '▾ 更多' : '▸ 更多：项目、时段、工具、命令、技能、模型'}
+            label={view.showActivity ? '▾ 更多' : '▸ 更多：项目、模型、工具上下文、技能'}
             plain
             onPress={() => setView(v => ({ ...v, showActivity: !v.showActivity }))}
           />
           {view.showActivity ? (
             <Text dimColor size="footnote">
-              点排行里的一项，下方「会话」只列出用过它的会话；再点一次取消。「最近」按天记录，精确到当天。
+              点任意项可筛选下方「会话」；再点一次取消。工具 token 按入参与返回内容估算（约 4 字符 ≈ 1 token）。
             </Text>
           ) : null}
           {view.showActivity ? (
             <Box flexDirection="column" gap={4}>
-              {/* 项目 + 时段 */}
+              {/* 第一行：项目（按成本 + 最近日期） + 模型（按成本 + 占比） */}
               <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
                   <Section title="项目" note="按成本" stat={ranks.proj.size > 0 ? `${ranks.proj.size} 个` : undefined}>
-                    {rankList('proj', v => fmtUsd(v))}
+                    {rankList('proj', v => fmtUsd(v), it => fmtDayAgo(it.lastDay, today))}
                   </Section>
                 </Box>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="时段" stat={total.req > 0 ? `最忙 ${busiest}:00–${busiest + 1}:00` : undefined}>
-                    {Svg ? (
-                      <Chart source={hoursSvg(total.hours, half)} alt="按小时的请求分布" isInteractive />
-                    ) : (
-                      <Text color={ACCENT}>{sparkline(hourVals, Math.max(1, ...hourVals))}</Text>
+                  <Section
+                    title="模型"
+                    note={modelTotalUsd > 0 ? '按成本' : '按请求数'}
+                    stat={ranks.model.size > 0 ? `${ranks.model.size} 个 · ${total.req} 次请求` : undefined}
+                  >
+                    {rankList(
+                      'model',
+                      v => (modelTotalUsd > 0 ? fmtUsd(v) : `×${Math.round(v * 1e9)}`),
+                      it => (modelTotalUsd > 0 ? pct(it.value, modelTotalUsd) : undefined),
                     )}
                   </Section>
                 </Box>
               </Box>
+              {/* 第二行：工具上下文（按估算 token + 次数，支持展开 MCP） + 技能（使用次数 + 已装未用） */}
               <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
                   <Section
-                    title="工具调用"
-                    stat={rankStat('tool', '次')}
+                    title="工具上下文"
+                    note="按估算 token"
+                    stat={toolTotalTokens > 0 ? `${ranks.tool.size} 项 · 约 ${fmtTokens(toolTotalTokens)}` : undefined}
                     right={
                       <Button
                         key="toggle-mcp"
@@ -1196,24 +1229,30 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                       />
                     }
                   >
-                    {rankList('tool', count)}
+                    {rankList('tool', v => fmtTokens(v), it => `×${it.subCount}`)}
                   </Section>
                 </Box>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="命令" stat={rankStat('prog', '次')}>
-                    {rankList('prog', count)}
-                  </Section>
-                </Box>
-              </Box>
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="技能" stat={rankStat('skill', '次')}>
-                    {rankList('skill', count)}
-                  </Section>
-                </Box>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="模型" note="按请求数" stat={rankStat('model', '次')}>
-                    {rankList('model', count)}
+                  <Section
+                    title="技能"
+                    stat={
+                      installedSkills.length > 0
+                        ? `已用 ${ranks.skill.size} / 已装 ${installedSkills.length}`
+                        : skillTotalCalls > 0
+                          ? `${ranks.skill.size} 项 · ${skillTotalCalls} 次`
+                          : undefined
+                    }
+                  >
+                    <Box flexDirection="column" gap={2}>
+                      {rankList('skill', count)}
+                      {unusedSkills.length > 0 ? (
+                        <Text dimColor size="footnote">
+                          这段时间未使用（{unusedSkills.length} 个，常驻系统提示词）：
+                          {unusedSkills.slice(0, 12).join('、')}
+                          {unusedSkills.length > 12 ? ` 等 ${unusedSkills.length} 个` : ''}
+                        </Text>
+                      ) : null}
+                    </Box>
                   </Section>
                 </Box>
               </Box>

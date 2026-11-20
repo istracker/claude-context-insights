@@ -10,16 +10,16 @@ import type {
   SessionAgg,
   SessionDetail,
 } from '../types'
-import { NO_ACCOUNTS, setAccounts, setDetail, setScanState, setSessions } from './state'
+import { NO_ACCOUNTS, setAccounts, setDetail, setInstalledSkills, setScanState, setSessions } from './state'
 import { addCount, billingWeight, detectContextDrops, programOf } from './util'
 
 export { billingWeight }
 
 const LABELS_KEY = 'account-labels-1'
 const CHUNK = 4 * 1024 * 1024
-const STORE_PREFIX = 'agg4:'
+const STORE_PREFIX = 'agg5:'
 /** 旧版本的缓存前缀，扫描时清掉 */
-const OLD_PREFIXES = ['agg1:', 'agg2:', 'agg3:']
+const OLD_PREFIXES = ['agg1:', 'agg2:', 'agg3:', 'agg4:']
 const MAP_CAP = 40
 
 export function emptyAgg(id: string, file: string, isSub: boolean): SessionAgg {
@@ -36,7 +36,7 @@ export function emptyAgg(id: string, file: string, isSub: boolean): SessionAgg {
 }
 
 function emptyDay(): DayAgg {
-  return { in: 0, out: 0, cr: 0, cw: 0, cw1h: 0, req: 0, prompts: 0, models: {}, tools: {}, skills: {}, programs: {}, hours: {} }
+  return { in: 0, out: 0, cr: 0, cw: 0, cw1h: 0, req: 0, prompts: 0, models: {}, modelWeight: {}, tools: {}, toolTokens: {}, skills: {} }
 }
 
 /** 时间戳 → 本地小时 0–23 */
@@ -107,10 +107,12 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
       day.cr += tcr
       day.cw += tcw
       day.cw1h += tcw1h
-      agg.weight += billingWeight(tin, tout, tcr, tcw, tcw1h, model)
+      const reqW = billingWeight(tin, tout, tcr, tcw, tcw1h, model)
+      agg.weight += reqW
       day.req += 1
       addCount(day.models, model)
-      addCount(day.hours, String(hourOf(ts, tzMin)))
+      day.modelWeight ??= {}
+      addCount(day.modelWeight, model, reqW)
     }
     if (ts === undefined) return
     const day = dayOf(agg, ts, tzMin)
@@ -121,22 +123,47 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
       const name = str(block.name) ?? 'unknown'
       addCount(day.tools, name)
       const input = obj(block.input)
+      // 工具入参本身占用的上下文估算 token（约 4 字符 ≈ 1 token，最少计 1）
+      const inChars = input ? JSON.stringify(input).length : 0
+      day.toolTokens ??= {}
+      addCount(day.toolTokens, name, Math.max(1, Math.round(inChars / 4)))
+      const tid = str(block.id)
+      if (tid) {
+        agg.pendingTools ??= {}
+        agg.pendingTools[tid] = name
+      }
       if (name === 'Skill') {
         const skill = str(input?.skill)
         if (skill) addCount(day.skills, skill)
-      } else if (name === 'Bash') {
-        const cmd = str(input?.command)
-        const prog = cmd ? programOf(cmd) : undefined
-        if (prog) addCount(day.programs, prog)
       }
     }
     return
   }
-  if (line.includes('"type":"user"') && line.includes('"turnOrigin":"human"')) {
+  if (line.includes('"type":"user"') && (line.includes('"turnOrigin":"human"') || line.includes('"tool_result"'))) {
     const d = parse(line)
     if (!d || d.type !== 'user') return
     const ts = touch(agg, d)
-    if (ts !== undefined) dayOf(agg, ts, tzMin).prompts += 1
+    if (ts === undefined) return
+    if (line.includes('"turnOrigin":"human"')) dayOf(agg, ts, tzMin).prompts += 1
+    if (agg.pendingTools && line.includes('"tool_result"')) {
+      const msg = obj(d.message)
+      const content = Array.isArray(msg?.content) ? msg.content : []
+      for (const raw of content) {
+        const block = obj(raw)
+        if (!block || block.type !== 'tool_result') continue
+        const tid = str(block.tool_use_id)
+        const toolName = tid ? agg.pendingTools[tid] : undefined
+        if (!tid || !toolName) continue
+        delete agg.pendingTools[tid]
+        const c = block.content
+        const resChars = typeof c === 'string' ? c.length : c !== undefined ? JSON.stringify(c).length : 0
+        if (resChars > 0) {
+          const day = dayOf(agg, ts, tzMin)
+          day.toolTokens ??= {}
+          addCount(day.toolTokens, toolName, Math.round(resChars / 4))
+        }
+      }
+    }
     return
   }
   if (line.startsWith('{"type":"cost-state"')) {
@@ -218,10 +245,17 @@ export async function scanFile(
     await onBytes(lastNl + 1)
   }
   agg.size = size
+  if (agg.pendingTools) {
+    const keys = Object.keys(agg.pendingTools)
+    if (keys.length === 0) delete agg.pendingTools
+    else if (keys.length > 32) {
+      agg.pendingTools = Object.fromEntries(keys.slice(-32).map(k => [k, agg.pendingTools![k]!]))
+    }
+  }
   for (const d of Object.values(agg.days)) {
     d.tools = capMap(d.tools)
+    if (d.toolTokens) d.toolTokens = capMap(d.toolTokens)
     d.skills = capMap(d.skills)
-    d.programs = capMap(d.programs)
   }
 }
 
@@ -483,6 +517,18 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
   }
 }
 
+/** 扫描本机已安装的技能目录（~/.claude/skills 与 ~/.agents/skills），用于找出「已装但未用」的技能 */
+export async function loadInstalledSkills($: EngineInterface, claudeDir: string, home: string): Promise<string[]> {
+  const names = new Set<string>()
+  for (const dir of [`${claudeDir}/skills`, `${home}/.agents/skills`]) {
+    const entries = await $.fs.list(dir).catch(() => [])
+    for (const e of entries) {
+      if ((e.kind === 'dir' || e.isLink) && !e.name.startsWith('.')) names.add(e.name)
+    }
+  }
+  return [...names].sort()
+}
+
 let running = false
 
 /** 增量扫描所有会话日志；已在跑就直接返回 */
@@ -498,8 +544,12 @@ export async function runScan($: EngineInterface): Promise<void> {
     const tzMin = await localTzMinutes($)
     const targets = await listTargets($, root)
     const sessionId = await $.session.id().catch(() => undefined)
-    const accounts = await loadAccounts($, home, sessionId, { claudeDir, appData }).catch(() => NO_ACCOUNTS)
+    const [accounts, installedSkills] = await Promise.all([
+      loadAccounts($, home, sessionId, { claudeDir, appData }).catch(() => NO_ACCOUNTS),
+      loadInstalledSkills($, claudeDir, home).catch(() => [] as string[]),
+    ])
     await setAccounts($, () => accounts)
+    await setInstalledSkills($, () => installedSkills)
 
     // 读出缓存
     const cached = new Map<string, SessionAgg>()

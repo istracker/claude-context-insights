@@ -55,9 +55,12 @@ const snapshotAtom = atom({ plugin: 'cc-context-insights', key: 'snapshot' } as 
 })
 const busyAtom = atom({ plugin: 'cc-context-insights', key: 'busy' } as const, false, { shape: 'busy-1' })
 
-// 会话汇总：agg4 起按模型区分缓存读取倍率（Opus/Sonnet 5.5 为 0.05×）
+// 会话汇总：agg5 起记录各模型计费权重（按成本排模型）与工具上下文估算 token
 const sessionsAtom = atom({ plugin: 'cc-context-insights', key: 'sessions' } as const, [] as SessionAgg[], {
-  shape: 'sessions-4',
+  shape: 'sessions-5',
+})
+const installedSkillsAtom = atom({ plugin: 'cc-context-insights', key: 'installed-skills' } as const, [] as string[], {
+  shape: 'installed-skills-1',
 })
 const scanAtom = atom({ plugin: 'cc-context-insights', key: 'scan' } as const, IDLE_SCAN, { shape: 'scan-1' })
 const DEFAULT_VIEW: InsightView = { range: '7d', sort: 'recent' }
@@ -168,6 +171,13 @@ export function getDetail($: EngineInterface) {
 }
 export function setDetail($: EngineInterface, fn: (v: SessionDetail | null) => SessionDetail | null) {
   return update($, detailAtom, fn)
+}
+
+export function getInstalledSkills($: EngineInterface) {
+  return read($, installedSkillsAtom)
+}
+export function setInstalledSkills($: EngineInterface, fn: (v: string[]) => string[]) {
+  return update($, installedSkillsAtom, fn)
 }
 
 // ---------- 实时订阅额度短期缓存（存在本会话状态中，避免总览每次渲染重复调 $.session.usage()） ----------

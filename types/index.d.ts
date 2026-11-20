@@ -69,11 +69,12 @@ export type DayAgg = {
   req: number
   prompts: number
   models: Record<string, number>
+  /** 各模型当天的计费权重，用于把当天成本按模型分摊 */
+  modelWeight?: Record<string, number>
   tools: Record<string, number>
+  /** 各工具当天往上下文塞入的估算 token（入参 + 返回结果按 4 字符≈1 token 折算） */
+  toolTokens?: Record<string, number>
   skills: Record<string, number>
-  programs: Record<string, number>
-  /** 按本地小时（"0"–"23"）计的请求数 */
-  hours: Record<string, number>
 }
 
 /** 一个日志文件（主会话或子 Agent）的汇总，存在 $.store 里，跨会话保留 */
@@ -88,6 +89,8 @@ export type SessionAgg = {
   /** 正在跳过一行超过 4 MiB 的超长行 */
   skipping: boolean
   lastReq?: string
+  /** 最近发起的 tool_use id → 工具名（用于把后续 tool_result 的大小归到对应工具） */
+  pendingTools?: Record<string, string>
   cwd?: string
   title?: string
   lastPrompt?: string
@@ -95,7 +98,7 @@ export type SessionAgg = {
   lastAt?: number
   /** cost-state 记录的会话总成本（含子 Agent），本地估算 */
   costUsd?: number
-  /** 计费权重累计（输入=1，5 分钟缓存写 1.25、1 小时 2、缓存读 0.1、输出 5） */
+  /** 计费权重累计（输入=1，5 分钟缓存写 1.25、1 小时 2、缓存读 0.05～0.1、输出 5） */
   weight: number
   /** 读到最后一条 cost-state 时的权重累计；之后的部分要另行估算 */
   costAtWeight?: number
@@ -199,7 +202,7 @@ export type InsightView = {
 }
 
 /** 「更多」里可点选筛选的排行 */
-export type RankKind = 'proj' | 'tool' | 'prog' | 'skill' | 'model'
+export type RankKind = 'proj' | 'model' | 'tool' | 'skill'
 
 /** 账号的显示信息，见过一次就记住 */
 export type AccountLabel = {
@@ -232,6 +235,8 @@ declare module 'claude-code' {
       limits: Shaped<Record<string, RateSnapshot>>
       /** 本会话最近一次实时拉取的额度（短期缓存，避免高频重渲染重复调 usage） */
       'live-limits': Shaped<RateSnapshot | null>
+      /** 本机已安装的技能名列表（用于找出「已装但未用」的技能） */
+      'installed-skills': Shaped<string[]>
       /** 正在查看哪个会话的上下文；null 为洞察总览 */
       focus: Shaped<string | null>
       /** 正在查看的非当前会话的详情 */

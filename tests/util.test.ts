@@ -54,7 +54,7 @@ function session(id: string, opts: { weight: number; costUsd?: number; isSub?: b
   a.days = {
     '2026-11-20': {
       in: opts.weight, out: 0, cr: 0, cw: 0, cw1h: 0, req: 1, prompts: 1,
-      models: { m: 1 }, tools: {}, skills: {}, programs: {}, hours: {},
+      models: { m: 1 }, modelWeight: { m: opts.weight }, tools: {}, toolTokens: {}, skills: {},
     },
   }
   return a
@@ -151,20 +151,33 @@ test('paneWidths 与图表下限一致：窄面板与双栏临界点不溢宽', 
   expect(paneWidths(74).half).toBeGreaterThanOrEqual(200)
 })
 
-test('排行：次数、最近日期、用过它的会话；未估价项目不计入项目排行；MCP 工具按服务合并', () => {
+test('排行：项目与模型按成本、工具按上下文估算 token（副计数保留次数）、技能按次数；未估价项目不进项目排行', () => {
   const [a, b] = mergeSessions([session('a', { weight: 100, costUsd: 1 }), session('b', { weight: 50, costUsd: 0.5 })])
   const [unpriced] = mergeSessions([session('u', { weight: 50 })])
   if (!a || !b || !unpriced) throw new Error('缺少会话')
-  a.days['2026-11-19'] = { ...a.days['2026-11-20']!, tools: { Bash: 2 }, programs: { git: 2 } }
+  a.days['2026-11-19'] = {
+    ...a.days['2026-11-20']!,
+    models: { opus: 1, haiku: 4 },
+    modelWeight: { opus: 80, haiku: 20 },
+    tools: { Bash: 2 },
+    toolTokens: { Bash: 500 },
+  }
+  a.dayUsd['2026-11-19'] = 0.5
   a.days['2026-11-20']!.tools = { Bash: 1, mcp__srv__x: 1, mcp__srv__y: 2 }
+  a.days['2026-11-20']!.toolTokens = { Bash: 300, mcp__srv__x: 1200, mcp__srv__y: 2800 }
   b.days['2026-11-20']!.tools = { Bash: 1 }
+  b.days['2026-11-20']!.toolTokens = { Bash: 200 }
   const r = rankIndex([a, b, unpriced], undefined, false)
-  expect(r.tool.get('Bash')?.value).toBe(4)
+  // 工具按估算 token 排：srv（MCP）= 4000 token（3 次），Bash = 1000 token（4 次）
+  expect(r.tool.get('srv（MCP）')?.value).toBe(4000)
+  expect(r.tool.get('srv（MCP）')?.subCount).toBe(3)
+  expect(r.tool.get('Bash')?.value).toBe(1000)
+  expect(r.tool.get('Bash')?.subCount).toBe(4)
   expect([...(r.tool.get('Bash')?.ids ?? [])].sort()).toEqual(['a', 'b'])
   expect(r.tool.get('Bash')?.lastDay).toBe('2026-11-20')
-  expect(r.prog.get('git')?.lastDay).toBe('2026-11-19')
-  expect(r.tool.get('srv（MCP）')?.value).toBe(3)
-  expect([...(r.prog.get('git')?.ids ?? [])]).toEqual(['a'])
+  // 模型按成本排：11-19 当天成本 $0.5，opus 权重占 80%（$0.4）高于 haiku（$0.1，尽管 haiku 请求数 4 > 1）
+  expect((r.model.get('opus')?.value ?? 0) > (r.model.get('haiku')?.value ?? 0)).toBe(true)
+  expect(r.model.get('haiku')?.subCount).toBe(4)
   // 未估价会话（dayUsd = 0）不进项目排行，避免抬头项目数与列表不一致
   expect(r.proj.get('未知项目')?.ids.has('u')).toBe(false)
   // 不在范围内的天不计
