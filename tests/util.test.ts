@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { mergeSessions } from '../hooks/insights'
-import { emptyAgg } from '../hooks/scan'
+import { emptyAgg, loadAccounts } from '../hooks/scan'
 import { fmtTokens, fmtUntil, programOf } from '../hooks/util'
 import type { SessionAgg } from '../types'
 
@@ -66,4 +66,36 @@ test('单价学习：只有带子 Agent 的样本时，分母计入子 Agent 权
     session('live', { weight: 100 }),
   ])
   expect(Math.round((out.find(s => s.id === 'live')?.costUsd ?? 0) * 1e6) / 1e6).toBe(1)
+})
+
+test('当前账号：桌面端登录的账号与 CLI（~/.claude.json）不同时，以本会话所在账号为准', async () => {
+  const desk = '/h/Library/Application Support/Claude/claude-code-sessions'
+  const dir = (name: string) => ({ name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
+  const files: Record<string, string> = {
+    [`${desk}/acctA/org/local_1.json`]: '{"cliSessionId":"desk-session"}',
+    [`${desk}/acctB/org/local_1.json`]: '{"cliSessionId":"cli-session"}',
+    // CLI 登录的是 B
+    '/h/.claude.json': '{"oauthAccount":{"accountUuid":"acctB","emailAddress":"b@x.com"}}',
+  }
+  // loadAccounts 只用到 fs.list / fs.read / store.get / store.set
+  const $ = {
+    fs: {
+      list: async (path: string) => {
+        if (path === desk) return [dir('acctA'), dir('acctB')]
+        if (path === `${desk}/acctA` || path === `${desk}/acctB`) return [dir('org')]
+        if (path.endsWith('/org')) return [{ name: 'local_1.json', kind: 'file', size: 40, mtimeMs: 0, isLink: false }]
+        return []
+      },
+      read: async (path: string) => files[path] ?? '',
+    },
+    store: { get: async () => undefined, set: async () => undefined },
+  } as unknown as Parameters<typeof loadAccounts>[0]
+
+  // 本会话记在 A 下：当前账号是 A；B 的邮箱照样记下
+  const a = await loadAccounts($, '/h', 'desk-session')
+  expect(a.current).toBe('acctA')
+  expect(a.labels.acctB?.email).toBe('b@x.com')
+  // 本会话还没被桌面端记录（如纯 CLI 会话）：退回 ~/.claude.json
+  expect((await loadAccounts($, '/h', 'unknown')).current).toBe('acctB')
+  expect((await loadAccounts($, '/h')).current).toBe('acctB')
 })

@@ -273,7 +273,7 @@ async function listTargets($: EngineInterface, root: string): Promise<Target[]> 
  * claude-code-sessions/<账号 id>/<组织 id>/local_*.json，其中 cliSessionId 就是日志文件名。
  * 当前登录账号与邮箱来自 ~/.claude.json 的 oauthAccount；见过的邮箱记在 $.store，切换账号后仍能显示。
  */
-export async function loadAccounts($: EngineInterface, home: string): Promise<AccountMap> {
+export async function loadAccounts($: EngineInterface, home: string, currentSessionId?: string): Promise<AccountMap> {
   const base = `${home}/Library/Application Support/Claude/claude-code-sessions`
   const bySession: Record<string, string> = {}
   for (const acct of await $.fs.list(base).catch(() => [])) {
@@ -299,12 +299,15 @@ export async function loadAccounts($: EngineInterface, home: string): Promise<Ac
     const o = obj(v)
     if (o) labels[k] = { email: str(o.email), name: str(o.name) }
   }
-  let current: string | undefined
+  // 当前账号：优先看本会话记在桌面端哪个账号目录下。
+  // ~/.claude.json 的 oauthAccount 是 CLI 的登录账号，桌面端可以登录另一个账号，不能只信它
+  let current: string | undefined = currentSessionId ? bySession[currentSessionId] : undefined
   const cfg = parse(await $.fs.read(`${home}/.claude.json`).catch(() => ''))
   const oauth = obj(cfg?.oauthAccount)
   const uuid = str(oauth?.accountUuid)
   if (uuid) {
-    current = uuid
+    current ??= uuid
+    // 邮箱与 uuid 一一对应，不论它是不是当前账号都可以记下
     const label: AccountLabel = { email: str(oauth?.emailAddress), name: str(oauth?.displayName) }
     const old = labels[uuid]
     if (old?.email !== label.email || old?.name !== label.name) {
@@ -480,7 +483,8 @@ export async function runScan($: EngineInterface): Promise<void> {
     const root = `${home}/.claude/projects`
     const tzMin = await localTzMinutes($)
     const targets = await listTargets($, root)
-    const accounts = await loadAccounts($, home).catch(() => NO_ACCOUNTS)
+    const sessionId = await $.session.id().catch(() => undefined)
+    const accounts = await loadAccounts($, home, sessionId).catch(() => NO_ACCOUNTS)
     await update($, accountsAtom, () => accounts)
 
     // 读出缓存
