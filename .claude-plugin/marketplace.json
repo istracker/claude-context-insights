@@ -1,0 +1,11 @@
+{
+  "name": "cc-context-insights-local",
+  "owner": { "name": "Lcp" },
+  "plugins": [
+    {
+      "name": "cc-context-insights",
+      "source": "./",
+      "description": "上下文洞察面板：订阅额度、成本与 token、会话与活动（非官方）"
+    }
+  ]
+}
