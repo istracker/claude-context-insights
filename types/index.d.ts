@@ -172,7 +172,14 @@ export type InsightView = {
   showActivity?: boolean
   /** 账号筛选：账号 id，'none' 为未归属；不填为全部 */
   account?: string
+  /** 排行里点选的一项：会话列表只列用过它的会话 */
+  pick?: { kind: RankKind; key: string }
+  /** 哪些排行已展开显示全部 */
+  openRanks?: RankKind[]
 }
+
+/** 「更多」里可点选筛选的排行 */
+export type RankKind = 'proj' | 'tool' | 'prog' | 'skill' | 'model'
 
 /** 账号的显示信息，见过一次就记住 */
 export type AccountLabel = {

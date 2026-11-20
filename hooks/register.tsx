@@ -15,7 +15,7 @@ import { ACCENT, BLUE, GREY, ORANGE, PALETTE, contextTrendSvg, stackSvg, svgSize
 import { groupTools, renderInsights, renderSessionDetail, startInsights } from './insights'
 import { runScan } from './scan'
 import type { PaneInput } from './insights'
-import { bump, dropMisfiledLimits, fmtTokens, sessionAccount, fmtUntil, fmtUsd, paneWidths, pct, programOf, sparkline, textBar, topEntries, windowLabel } from './util'
+import { bump, cardStyle, dropMisfiledLimits, fmtTokens, sessionAccount, fmtUntil, fmtUsd, paneWidths, pct, programOf, sparkline, textBar, topEntries, windowLabel } from './util'
 
 const PLUGIN = 'cc-context-insights'
 const PANE = 'cc-context-insights'
@@ -101,7 +101,10 @@ async function saveLimits($: EngineInterface, windows: RateWindow[], at: number)
   // 同一份读数若还挂在别的账号下（以前认错账号时存的），一并清掉
   const next = { ...dropMisfiledLimits(rest, account, windows), [account]: { at, windows } }
   await $.store.set(LIMITS_STORE_KEY, next)
-  await update($, limitsAtom, cur => ({ ...dropMisfiledLimits(cur, account, windows), ...next }))
+  await update($, limitsAtom, cur => {
+    const { current: _early, ...curRest } = cur
+    return { ...dropMisfiledLimits(curRest, account, windows), ...next }
+  })
 }
 
 // ---------- 工具调用归类 ----------
@@ -115,12 +118,15 @@ const SEARCH_TOOLS = new Set(['Grep', 'Glob', 'WebSearch', 'ToolSearch'])
 
 /** 正在刷新时又要求精确统计：记下来，本次结束后补做，不能丢 */
 let pendingFull = false
+/** 同步重入锁，避免两次紧邻调用在 await read(busy) 之间同时进入 */
+let refreshing = false
 
 async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<void> {
-  if (await read($, busy)) {
+  if (refreshing || (await read($, busy))) {
     if (detail === 'full') pendingFull = true
     return
   }
+  refreshing = true
   if (detail === 'full') pendingFull = false
   await update($, busy, () => true)
   try {
@@ -156,6 +162,7 @@ async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<
   } catch (err) {
     $.ui.log(`${PLUGIN}: 刷新失败 ${String(err)}`)
   } finally {
+    refreshing = false
     await update($, busy, () => false)
     if (pendingFull) {
       pendingFull = false
@@ -281,10 +288,22 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
     const { Box, Text, Button } = els
     // 终端的元素表里也有 Svg，但画不出来：按绘制端判断，终端用文字兜底
     const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
-    // 显式给高度（不给时桌面端内嵌框默认 150px）；宽度留空，由宿主按「自身宽度、不超过面板」决定。
+    const card = cardStyle(e.surface)
+    // 显式给宽高（不给高度时桌面端内嵌框默认 150px）。宽度也要给：不给时宿主会把图放大铺满面板、底部被裁。
     // 高度多留 4%，防宽度略估大时被等比缩放后裁底
-    const Chart = (p: { source: string; alt: string; isInteractive?: boolean }) =>
-      Svg ? <Svg source={p.source} alt={p.alt} height={Math.ceil(svgSize(p.source).height * 1.04) + 2} isInteractive /> : null
+    const Chart = (p: { source: string; alt: string; isInteractive?: boolean }) => {
+      if (!Svg) return null
+      const size = svgSize(p.source)
+      return (
+        <Svg
+          source={p.source}
+          alt={p.alt}
+          width={size.width}
+          height={Math.ceil(size.height * 1.04) + 2}
+          isInteractive
+        />
+      )
+    }
     const snap = await read($, snapshot)
     const list = await read($, steps)
     const turnCount = await read($, turns)
@@ -327,7 +346,7 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
 
     // ----- 小组件 -----
     const Section = (props: { title: string; note?: string; right?: JSX.Element | null; children?: unknown }) => (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} {...card}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
           <Box flexDirection="row" columnGap={1} alignItems="center">
             <Text weight="semibold">{props.title}</Text>
@@ -386,9 +405,9 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
 
     // ----- 版面 -----
     return (
-      <Box flexDirection="column" gap={3} paddingX={1} paddingY={1}>
+      <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
         {/* 窗口占用：版式对齐 Claude 自己的上下文用量界面 */}
-        <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column" gap={1} {...card}>
           <Box flexDirection="row" justifyContent="space-between" alignItems="flex-end" columnGap={2}>
             <Text size="heading" weight="medium" tabular color={(percent ?? 0) >= 80 ? ORANGE : undefined}>
               已使用 {percent === undefined ? '—' : `${percent}%`}

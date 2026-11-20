@@ -71,7 +71,7 @@ export function dailyAverage(series: DayPoint[]): number {
  * 今天的金额和日均都放在标题旁，图内不标数字：窄屏或相邻柱较高时标签必然相撞。
  */
 export function dailySvg(series: DayPoint[], width = 520): string {
-  const W = clampW(width, 280)
+  const W = clampW(width, 240)
   const H = 180
   const left = 44
   const right = 16
@@ -167,24 +167,14 @@ export function stackSvg(segs: Segment[], width = 400): string {
   return svg(W, H, `<clipPath id="c"><rect width="${W}" height="${H}" rx="5"/></clipPath><g clip-path="url(#c)">${body}</g>`)
 }
 
-/** 横向排行：名称 · 条 · 数值，一行一项 */
-export function rankSvg(rows: [string, number][], fmt: (n: number) => string, width = 340): string {
-  const W = clampW(width, 220)
-  const row = 26
-  const labelW = Math.min(200, Math.round(W * 0.38))
-  const valueW = 64
-  const barW = W - labelW - valueW - 8
-  const maxChars = Math.floor((labelW - 8) / 7.5)
-  const max = Math.max(1, ...rows.map(r => r[1]))
-  const body = rows
-    .map(([k, v], i) => {
-      const yy = i * row
-      const name = k.length > maxChars ? k.slice(0, maxChars - 1) + '…' : k
-      const w = Math.max(3, (v / max) * barW)
-      return `<g><title>${escapeXml(k)} · ${fmt(v)}</title><text class="ink" x="0" y="${yy + 17}">${escapeXml(name)}</text><rect x="${labelW}" y="${yy + 8}" width="${barW}" height="10" rx="3" class="track"/><rect x="${labelW}" y="${yy + 8}" width="${w.toFixed(1)}" height="10" rx="3" fill="${ACCENT}" ${i === 0 ? '' : 'class="dim"'}/><text x="${W}" y="${yy + 17}" text-anchor="end" class="ink">${escapeXml(fmt(v))}</text></g>`
-    })
-    .join('')
-  return svg(W, rows.length * row, body)
+/** 排行行下的细进度线：轨道底色 + 实色部分（单行大量渲染，用精简样式） */
+const LINE_STYLE = `<style>:root{--track:#EDEDED}@media (prefers-color-scheme:dark){:root{--track:#363636}}.track{fill:var(--track)}</style>`
+
+export function lineSvg(fraction: number, width: number, color: string): string {
+  const W = clampW(width, 60)
+  const H = 4
+  const w = Math.max(2, Math.min(1, Math.max(0, fraction)) * W)
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;height:auto">${LINE_STYLE}<rect width="${W}" height="${H}" rx="2" class="track"/><rect width="${w.toFixed(1)}" height="${H}" rx="2" fill="${color}"/></svg>`
 }
 
 /**
@@ -192,7 +182,7 @@ export function rankSvg(rows: [string, number][], fmt: (n: number) => string, wi
  * 虚线为自动压缩阈值，标在右侧。纵轴以窗口大小为上限，一眼看出离压缩还有多远。
  */
 export function contextTrendSvg(values: number[], window: number, compactAt: number | undefined, width = 520): string {
-  const W = clampW(width, 280)
+  const W = clampW(width, 240)
   const H = 136
   const left = 44
   const right = compactAt !== undefined ? 64 : 16

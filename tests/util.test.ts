@@ -1,8 +1,18 @@
 import { expect, test } from 'claude-code/testing'
 
-import { mergeSessions } from '../hooks/insights'
+import { contextTrendSvg, dailySvg, svgSize } from '../hooks/charts'
+import { mergeSessions, rankIndex, toolKey } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
-import { dropMisfiledLimits, fmtTokens, fmtUntil, programOf, sameAccountWindows, sessionAccount } from '../hooks/util'
+import {
+  dropMisfiledLimits,
+  fmtDayAgo,
+  fmtTokens,
+  fmtUntil,
+  paneWidths,
+  programOf,
+  sameAccountWindows,
+  sessionAccount,
+} from '../hooks/util'
 import type { SessionAgg } from '../types'
 
 test('programOf：跳过 sudo/env 等前缀、赋值、注释与子 shell 括号', () => {
@@ -123,4 +133,38 @@ test('额度串号：按会话归属取账号；重置时间一致的旧读数�
     acctC: { at: 1, windows: w(50, '2026-11-20T16:00:00.000Z', '2026-11-22T08:00:00.000Z') },
   }
   expect(Object.keys(dropMisfiledLimits(stored, 'acctA', live)).sort()).toEqual(['acctC'])
+})
+
+test('paneWidths 与图表下限一致：窄面板与双栏临界点不溢宽', () => {
+  const narrow = paneWidths(40)
+  expect(narrow.full).toBe(240)
+  expect(svgSize(dailySvg([{ day: '2026-11-20', usd: 1, tokens: 100, req: 1, prompts: 1 }], narrow.full)).width).toBe(narrow.full)
+  expect(svgSize(contextTrendSvg([1000, 2000], 200_000, undefined, narrow.full)).width).toBe(narrow.full)
+  // 70 列放不下两张 200px 卡片，half 退回 full；74 列起才并排两栏
+  expect(paneWidths(70).half).toBe(paneWidths(70).full)
+  expect(paneWidths(74).half).toBeGreaterThanOrEqual(200)
+})
+
+test('排行：次数、最近日期、用过它的会话；未估价项目不计入项目排行；MCP 工具按服务合并', () => {
+  const [a, b] = mergeSessions([session('a', { weight: 100, costUsd: 1 }), session('b', { weight: 50, costUsd: 0.5 })])
+  const [unpriced] = mergeSessions([session('u', { weight: 50 })])
+  if (!a || !b || !unpriced) throw new Error('缺少会话')
+  a.days['2026-11-19'] = { ...a.days['2026-11-20']!, tools: { Bash: 2 }, programs: { git: 2 } }
+  a.days['2026-11-20']!.tools = { Bash: 1, mcp__srv__x: 1, mcp__srv__y: 2 }
+  b.days['2026-11-20']!.tools = { Bash: 1 }
+  const r = rankIndex([a, b, unpriced], undefined, false)
+  expect(r.tool.get('Bash')?.value).toBe(4)
+  expect([...(r.tool.get('Bash')?.ids ?? [])].sort()).toEqual(['a', 'b'])
+  expect(r.tool.get('Bash')?.lastDay).toBe('2026-11-20')
+  expect(r.prog.get('git')?.lastDay).toBe('2026-11-19')
+  expect(r.tool.get('srv（MCP）')?.value).toBe(3)
+  expect([...(r.prog.get('git')?.ids ?? [])]).toEqual(['a'])
+  // 未估价会话（dayUsd = 0）不进项目排行，避免抬头项目数与列表不一致
+  expect(r.proj.get('未知项目')?.ids.has('u')).toBe(false)
+  // 不在范围内的天不计
+  expect(rankIndex([a, b], new Set(['2026-11-18']), false).tool.size).toBe(0)
+  expect(toolKey('mcp__srv__x', true)).toBe('srv · x')
+  expect(fmtDayAgo('2026-11-20', '2026-11-20')).toBe('今天')
+  expect(fmtDayAgo('2026-11-19', '2026-11-20')).toBe('昨天')
+  expect(fmtDayAgo('2026-11-15', '2026-11-20')).toBe('5 天前')
 })

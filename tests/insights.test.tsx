@@ -142,7 +142,7 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
-    expect((await ui.find({ type: 'Text', text: /1 次提问$/ }))?.text).toContain('crm-ext')
+    expect((await ui.find({ type: 'Text', text: /crm-ext.*1 次提问$/ }))?.text).toContain('crm-ext')
     expect((await ui.find({ type: 'Text', text: /^\$1\.50$/ }))?.text).toBe('$1.50')
     // 进行中的会话：610 × (1.5 / 1220) = $0.75，标「≈」
     expect((await ui.find({ type: 'Text', text: /^≈ \$0\.750$/ }))?.text).toBe('≈ $0.750')
@@ -157,11 +157,16 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
       expect(svgs.every(s => typeof s.props.height === 'number' && (s.props.height as number) > 0)).toBe(true)
       // 每日成本图：内容 180 高，框高留了余量，不会被裁
       expect(svgs.some(s => (s.props.height as number) >= 180 && (s.props.height as number) <= 200)).toBe(true)
-      // 「更多」里的排行：框高固定为可见行数，内容可更高（在框内滑动）
+      // 每张图都显式带宽度，否则宿主会放大铺满面板、框高不变而裁掉底部
+      expect(svgs.every(s => typeof s.props.width === 'number' && (s.props.width as number) > 0)).toBe(true)
+      // 「更多」里的排行：一行一项，点一项后会话列表只列用过它的会话，再点取消
       await ui.press({ key: 'toggle-activity' })
-      const ranks = (await ui.findAll({ type: 'Svg' })).filter(s => s.props.alt === '排行')
-      expect(ranks.length).toBeGreaterThan(0)
-      expect(ranks.every(s => (s.props.height as number) <= 26 * 6 + 6)).toBe(true)
+      expect((await ui.find({ type: 'Text', text: /^tdd$/ }))?.text).toBe('tdd')
+      await ui.press({ key: 'pick-skill-tdd' })
+      expect((await ui.find({ type: 'Text', text: /用过技能「tdd」/ }))?.text).toContain('1 个')
+      expect((await ui.find({ type: 'Text', text: /^✓ tdd$/ }))?.text).toBe('✓ tdd')
+      await ui.press({ key: 'clear-pick' })
+      expect(await ui.find({ type: 'Text', text: /用过技能/ })).toBeUndefined()
       await ui.press({ key: 'toggle-activity' })
     }
     // 账号下拉里有当前账号

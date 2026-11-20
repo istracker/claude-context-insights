@@ -8,6 +8,7 @@ import type {
   InsightRange,
   InsightSort,
   InsightView,
+  RankKind,
   RateSnapshot,
   RateWindow,
   ScanState,
@@ -19,6 +20,7 @@ import {
   ACCENT,
   AMBER,
   BLUE,
+  GREY,
   ORANGE,
   PALETTE,
   TEAL,
@@ -26,14 +28,16 @@ import {
   dailyAverage,
   dailySvg,
   hoursSvg,
-  rankSvg,
+  lineSvg,
   stackSvg,
   svgSize,
 } from './charts'
 import type { DayPoint } from './charts'
 import {
   bump,
+  cardStyle,
   fmtAgo,
+  fmtDayAgo,
   fmtTokens,
   fmtUntil,
   fmtUsd,
@@ -364,6 +368,54 @@ export function shortTool(name: string): string {
   return m ? `${serverLabel(m[1] ?? '')} · ${m[2]}` : name
 }
 
+/** 工具在排行里的名字：MCP 工具默认按服务合并 */
+export function toolKey(name: string, expandMcp: boolean): string {
+  if (expandMcp) return shortTool(name)
+  const m = /^mcp__(.+?)__/.exec(name)
+  return m ? `${serverLabel(m[1] ?? '')}（MCP）` : name
+}
+
+/** 排行的一项：数值、最近用到的日期（YYYY-MM-DD）、用过它的会话 */
+export type RankItem = { value: number; lastDay: string; ids: Set<string> }
+
+/**
+ * 把会话在这段时间里的项目、工具、命令、技能、模型汇总成排行。
+ * 日志只按天记次数，所以「最近」精确到当天（YYYY-MM-DD）。
+ */
+export function rankIndex(
+  sessions: MergedSession[],
+  days: Set<string> | undefined,
+  expandMcp: boolean,
+): Record<RankKind, Map<string, RankItem>> {
+  const out: Record<RankKind, Map<string, RankItem>> = {
+    proj: new Map(),
+    tool: new Map(),
+    prog: new Map(),
+    skill: new Map(),
+    model: new Map(),
+  }
+  const add = (kind: RankKind, key: string, value: number, day: string, id: string) => {
+    const it = out[kind].get(key) ?? { value: 0, lastDay: '', ids: new Set<string>() }
+    it.value += value
+    if (day > it.lastDay) it.lastDay = day
+    it.ids.add(id)
+    out[kind].set(key, it)
+  }
+  for (const s of sessions) {
+    for (const [k, d] of Object.entries(s.days)) {
+      if (days && !days.has(k)) continue
+      // 项目按成本排行：只有产生费用的才计入，避免抬头项目数与列表「暂无」不一致
+      const usd = s.dayUsd[k] ?? 0
+      if (usd > 0) add('proj', s.project, usd, k, s.id)
+      for (const [name, n] of Object.entries(d.tools)) if (n > 0) add('tool', toolKey(name, expandMcp), n, k, s.id)
+      for (const [name, n] of Object.entries(d.programs)) if (n > 0) add('prog', name, n, k, s.id)
+      for (const [name, n] of Object.entries(d.skills)) if (n > 0) add('skill', name, n, k, s.id)
+      for (const [name, n] of Object.entries(d.models)) if (n > 0) add('model', name, n, k, s.id)
+    }
+  }
+  return out
+}
+
 /** 账号显示名：邮箱，没见过就用 id 前 4 位 */
 export function accountLabel(acc: AccountMap, id: string | undefined): string {
   if (id === undefined) return '未归属'
@@ -380,7 +432,6 @@ const RANGES: [InsightRange, string][] = [
   ['30d', '30 天'],
   ['all', '全部'],
 ]
-const RANGE_TITLE: Record<InsightRange, string> = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部时间' }
 const PREV_TITLE: Record<InsightRange, string> = { today: '昨天', '7d': '前 7 天', '30d': '前 30 天', all: '' }
 const SORTS: [InsightSort, string][] = [
   ['recent', '按时间'],
@@ -394,13 +445,11 @@ const PART_HINT: Record<Part, string> = {
   in: '没有命中缓存的输入',
 }
 const ACCOUNT_COLORS = PALETTE
-/** 排行模块：可见行数、最多行数、行高（与 rankSvg 一致） */
+/** 排行：默认显示几行、展开后最多几行 */
 const RANK_VISIBLE = 6
 const RANK_MAX = 20
-const RANK_ROW = 26
-/** 排行的标题旁注：超过可见行数时提示可滑动 */
-const rankNote = (n: number, base?: string): string | undefined =>
-  n > RANK_VISIBLE ? `${base ? base + ' · ' : ''}共 ${Math.min(n, RANK_MAX)} 项，可上下滑动` : base
+/** 排行点选的对象在会话筛选提示里怎么称呼 */
+const RANK_NOUN: Record<RankKind, string> = { proj: '项目', tool: '工具', prog: '命令', skill: '技能', model: '模型' }
 
 // ---------- 注册 ----------
 
@@ -425,27 +474,36 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const { Box, Text, Button, Select } = els
     // 终端的元素表里也有 Svg，但画不出来：按绘制端判断，终端用文字兜底
     const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
-    // 显式给高度（不给时桌面端内嵌框默认 150px）；宽度留空，由宿主按「自身宽度、不超过面板」决定。
-    // 高度多留 4%，防宽度略估大时被等比缩放后裁底；viewHeight 小于内容高度时，模块内部可上下滑动
+    const card = cardStyle(e.surface)
+    // 显式给宽高（不给高度时桌面端内嵌框默认 150px）。宽度也要给：不给时宿主会把图放大到铺满面板，
+    // 而框高仍按原图算，宽面板下底部（坐标轴、日期）就被裁掉。高度多留 4%，防宽度略估大时被等比缩放后裁底；viewHeight 小于内容高度时，模块内部可上下滑动
     const Chart = (p: { source: string; alt: string; isInteractive?: boolean; viewHeight?: number }) => {
       if (!Svg) return null
       // 注意：JSX 编译成全局 h(...)，局部变量不能叫 h
-      const contentHeight = svgSize(p.source).height
+      const size = svgSize(p.source)
       return (
-        <Svg source={p.source} alt={p.alt} height={p.viewHeight ?? Math.ceil(contentHeight * 1.04) + 2} isInteractive />
+        <Svg
+          source={p.source}
+          alt={p.alt}
+          width={size.width}
+          height={p.viewHeight ?? Math.ceil(size.height * 1.04) + 2}
+          isInteractive
+        />
       )
     }
     const aggs = await read($, sessionsAtom)
     const scan = await read($, scanAtom)
     const view = await read($, viewAtom)
     const storedAccounts = await read($, accountsAtom)
+    const currentSessionId = await $.session.id().catch(() => undefined)
     // 「当前」以本会话的归属为准（状态里的 current 可能是重新加载插件前算的）
     const accounts: AccountMap = {
       ...storedAccounts,
-      current: sessionAccount(storedAccounts, await $.session.id().catch(() => undefined)),
+      current: sessionAccount(storedAccounts, currentSessionId),
     }
     const now = await $.clock.now()
     const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
+    const today = dayKey(now, tzMin)
     const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
     const { full, half } = paneWidths(e.props.bodyColumns)
 
@@ -462,14 +520,12 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
 
     const days = rangeDays(view.range, now, tzMin)
     const total = emptyTotals()
-    let projects: Record<string, number> = {}
     let unpriced = 0
     const active: (MergedSession & { r: Totals })[] = []
     for (const s of scoped) {
       const r = addSession(total, s, days)
       if (r.req === 0 && r.prompts === 0) continue
       active.push({ ...s, r })
-      projects = bump(projects, s.project, r.usd)
       if (s.costUsd === undefined) unpriced += 1
     }
     const prompted = total.in + total.cr + total.cw
@@ -538,18 +594,29 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const topPart = parts[0]
     const hourVals = Array.from({ length: 24 }, (_, i) => total.hours[String(i)] ?? 0)
     const busiest = hourVals.indexOf(Math.max(...hourVals))
-    const sorted = [...active].sort((a, b) => (view.sort === 'cost' ? b.r.usd - a.r.usd : b.lastAt - a.lastAt))
+    // 排行：次数、最近用到的日期与用过它的会话；点选一项后会话列表只列用过它的会话
+    const ranks = rankIndex(active, days, view.expandMcp ?? false)
+    const pickedIds = view.pick ? (ranks[view.pick.kind].get(view.pick.key)?.ids ?? new Set<string>()) : undefined
+    const sorted = [...active]
+      .filter(s => pickedIds === undefined || pickedIds.has(s.id))
+      .sort((a, b) => (view.sort === 'cost' ? b.r.usd - a.r.usd : b.lastAt - a.lastAt))
     /** 会话 id → 主日志文件（双击后从它还原上下文） */
     const mainFiles = new Map(aggs.filter(a => !a.isSub).map(a => [a.id, a.file] as const))
-    const currentSessionId = await $.session.id().catch(() => undefined)
     const SESSIONS_MAX = 40
     const shownSessions = view.showAllSessions ? sorted.slice(0, SESSIONS_MAX) : sorted.slice(0, 6)
 
     // ----- 小组件 -----
-    const Section = (props: { title: string; note?: string; right?: JSX.Element | null; children?: unknown }) => (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
-          <Box flexDirection="row" columnGap={1} alignItems="center">
+    /** 区块卡片：标题 · 旁注 ··· 右上角关键数字 · 操作 */
+    const Section = (props: {
+      title: string
+      note?: string
+      stat?: string
+      right?: JSX.Element | null
+      children?: unknown
+    }) => (
+      <Box flexDirection="column" gap={1} {...card}>
+        <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
+          <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1}>
             <Text weight="semibold">{props.title}</Text>
             {props.note ? (
               <Text dimColor size="footnote">
@@ -557,34 +624,48 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               </Text>
             ) : null}
           </Box>
-          {props.right ?? null}
+          {props.stat || props.right ? (
+            <Box flexDirection="row" columnGap={2} alignItems="center">
+              {props.stat ? (
+                <Text tabular weight="medium">
+                  {props.stat}
+                </Text>
+              ) : null}
+              {props.right ?? null}
+            </Box>
+          ) : null}
         </Box>
         {props.children as JSX.Element}
       </Box>
     )
-    /** 三列图例：■ 名称 · 金额（灰）· 占比，与 Claude 原生上下文用量界面一致 */
-    /** 主数字：标签 · 大号数值 · 环比 */
-    const heroStat = (label: string, value: string, change: number | undefined) => (
-      <Box flexDirection="column">
-        <Text dimColor size="footnote">
+    /** KPI 宫格：宽面板 3 列、窄面板 2 列，按行铺满整宽，每格「标签 / 大数字 / 一行小注」 */
+    const kpiCols = e.props.bodyColumns >= 72 ? 3 : 2
+    const kpi = (key: string, label: string, value: string, note?: { text: string; color?: string }) => (
+      <Box key={key} flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0} {...card}>
+        <Text dimColor size="footnote" wrap="truncate-end">
           {label}
         </Text>
-        <Box flexDirection="row" alignItems="flex-end" columnGap={2}>
-          <Text weight="bold" size="title" tabular>
-            {value}
+        <Text weight="bold" size="title" tabular wrap="truncate-end">
+          {value}
+        </Text>
+        {note ? (
+          <Text size="footnote" color={note.color} dimColor={note.color === undefined} wrap="truncate-end">
+            {note.text}
           </Text>
-          {change !== undefined ? (
-            <Text
-              size="footnote"
-              color={change > 0.05 ? ORANGE : change < -0.05 ? TEAL : undefined}
-              dimColor={Math.abs(change) <= 0.05}
-            >
-              {change > 0 ? '↑' : '↓'} {Math.abs(change * 100).toFixed(0)}% 比{PREV_TITLE[view.range]}
-            </Text>
-          ) : null}
-        </Box>
+        ) : null}
       </Box>
     )
+    /** 环比小注：涨超 5% 橙色、降超 5% 绿色 */
+    const changeNote = (change: number | undefined) =>
+      change === undefined
+        ? undefined
+        : {
+            text:
+              Math.abs(change) < 0.005
+                ? `持平 比${PREV_TITLE[view.range]}`
+                : `${change > 0 ? '↑' : '↓'} ${Math.abs(change * 100).toFixed(0)}% 比${PREV_TITLE[view.range]}`,
+            color: change > 0.05 ? ORANGE : change < -0.05 ? TEAL : undefined,
+          }
     /** 图例：■ 名称 · [token] · 金额 · 占比 */
     const legendRow = (
       key: string,
@@ -622,33 +703,82 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       </Box>
     )
     /**
-     * 排行模块：固定显示 RANK_VISIBLE 行的高度，图里最多放 RANK_MAX 行，超出部分在模块内上下滑动。
-     * 终端没有内部滚动，只列前 RANK_VISIBLE 行。
+     * 排行：「名称 · 数值 · 最近一次」，下面一条细进度线；点一项筛选上方的会话，再点取消。
+     * 默认 RANK_VISIBLE 行，可展开到 RANK_MAX 行。
      */
-    const rankBlock = (key: string, rows: [string, number][], fmt: (v: number) => string, width = half) => {
-      const max = rows[0]?.[1] ?? 1
+    const rankList = (kind: RankKind, fmt: (v: number) => string, width = half) => {
+      const rows = [...ranks[kind].entries()].filter(([, it]) => it.value > 0).sort((a, b) => b[1].value - a[1].value)
       if (rows.length === 0) return <Text dimColor>暂无</Text>
-      return Svg ? (
-        <Chart
-          key={key}
-          source={rankSvg(rows.slice(0, RANK_MAX), fmt, width)}
-          alt="排行"
-          isInteractive
-          viewHeight={RANK_ROW * Math.min(rows.length, RANK_VISIBLE) + 6}
-        />
-      ) : (
-        <Box key={key} flexDirection="column">
-          {rows.slice(0, RANK_VISIBLE).map(([k, v]) => (
-            <Box key={`${key}-${k}`} flexDirection="row" columnGap={1}>
-              <Text color={ACCENT}>{textBar((v / max) * 100, 6)}</Text>
-              <Text wrap="truncate-end">{k}</Text>
-              <Text dimColor tabular>
-                {fmt(v)}
-              </Text>
-            </Box>
-          ))}
+      const isOpen = view.openRanks?.includes(kind) ?? false
+      const max = rows[0]?.[1].value ?? 1
+      const pickedHere = view.pick?.kind === kind
+      return (
+        <Box flexDirection="column" gap={1}>
+          {rows.slice(0, isOpen ? RANK_MAX : RANK_VISIBLE).map(([k, it], i) => {
+            const isPicked = pickedHere && view.pick?.key === k
+            return (
+              <Box key={`rk-${kind}-${k}`} flexDirection="column">
+                <Box flexDirection="row" alignItems="center" columnGap={2}>
+                  <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                    <Button
+                      key={`pick-${kind}-${k}`}
+                      plain
+                      dimColor={pickedHere && !isPicked}
+                      onPress={() => setView(v => ({ ...v, pick: isPicked ? undefined : { kind, key: k } }))}
+                    >
+                      <Text wrap="truncate-end" color={isPicked ? ACCENT : undefined} weight={isPicked ? 'semibold' : 'regular'}>
+                        {isPicked ? `✓ ${k}` : k}
+                      </Text>
+                    </Button>
+                  </Box>
+                  {Svg ? null : <Text color={ACCENT}>{textBar((it.value / max) * 100, 6)}</Text>}
+                  <Text tabular>{fmt(it.value)}</Text>
+                  <Box minWidth={9} justifyContent="flex-end">
+                    <Text dimColor size="footnote" tabular>
+                      {fmtDayAgo(it.lastDay, today)}
+                    </Text>
+                  </Box>
+                </Box>
+                {Svg ? (
+                  <Svg
+                    source={lineSvg(it.value / max, width, i === 0 || isPicked ? ACCENT : GREY)}
+                    alt={`${k} ${fmt(it.value)}`}
+                    width={width}
+                    height={4}
+                  />
+                ) : null}
+              </Box>
+            )
+          })}
+          {rows.length > RANK_VISIBLE ? (
+            <Button
+              key={`open-${kind}`}
+              label={
+                isOpen
+                  ? rows.length > RANK_MAX
+                    ? `收起（已显示前 ${RANK_MAX} 项，共 ${rows.length} 项）`
+                    : '收起'
+                  : rows.length > RANK_MAX
+                    ? `显示前 ${RANK_MAX} 项（共 ${rows.length} 项）`
+                    : `显示全部 ${rows.length} 项`
+              }
+              plain
+              dimColor
+              onPress={() =>
+                setView(v => ({
+                  ...v,
+                  openRanks: isOpen ? (v.openRanks ?? []).filter(x => x !== kind) : [...(v.openRanks ?? []), kind],
+                }))
+              }
+            />
+          ) : null}
         </Box>
       )
+    }
+    /** 排行标题右上角：合计 */
+    const rankStat = (kind: RankKind, unit: string) => {
+      const sum = [...ranks[kind].values()].reduce((a, it) => a + it.value, 0)
+      return sum > 0 ? `${ranks[kind].size} 项 · ${sum} ${unit}` : undefined
     }
     /** 一个额度窗口：名称 · 条 · 已用 · 重置时间 */
     const quotaRow = (key: string, w: RateWindow) => {
@@ -690,18 +820,9 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         </Box>
       )
     }
-    const count = (v: number) => String(v)
-    const top = (map: Record<string, number>, n: number) => topEntries(map, n).filter(([, v]) => v > 0)
-    const projRows = top(projects, RANK_MAX)
-    const toolRows = top(
-      view.expandMcp
-        ? Object.fromEntries(Object.entries(total.tools).map(([k, v]) => [shortTool(k), v]))
-        : groupTools(total.tools),
-      RANK_MAX,
-    )
-    const progRows = top(total.programs, RANK_MAX)
-    const skillRows = top(total.skills, RANK_MAX)
-    const modelRows = top(total.models, RANK_MAX)
+    const count = (v: number) => `×${v}`
+    const toolCalls = Object.values(total.tools).reduce((a, n) => a + n, 0)
+    const commandRuns = Object.values(total.programs).reduce((a, n) => a + n, 0)
     const pctDone = scan.totalBytes > 0 ? Math.round((scan.doneBytes / scan.totalBytes) * 100) : 100
 
     const accountOptions = [
@@ -710,9 +831,33 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       ...(hasUnassigned ? [{ value: 'none', label: '未归属' }] : []),
     ]
 
+    const kpiItems = [
+      kpi(
+        'kpi-usd',
+        '等价 API 成本',
+        fmtUsd(total.usd),
+        changeNote(delta) ??
+          (unpriced > 0
+            ? { text: `${unpriced} 个会话无法估价` }
+            : { text: total.usd > 0 ? '按标价折算' : '暂无费用' }),
+      ),
+      kpi('kpi-tokens', 'Token 消耗', fmtTokens(tokensOf(total)), changeNote(tokenDelta) ?? { text: `${total.req} 次请求` }),
+      kpi('kpi-sessions', '会话', String(active.length), { text: `${total.prompts} 次提问` }),
+      kpi('kpi-cache', '缓存命中', pct(total.cr, prompted), { text: `读取 ${fmtTokens(total.cr)} token` }),
+      kpi(
+        'kpi-per-prompt',
+        '每次提问',
+        total.prompts > 0 ? fmtUsd(total.usd / total.prompts) : '—',
+        total.prompts > 0 ? { text: `${fmtTokens(Math.round(tokensOf(total) / total.prompts))} token` } : { text: '暂无提问' },
+      ),
+      kpi('kpi-tools', '工具调用', String(toolCalls), { text: `命令执行 ${commandRuns} 次` }),
+    ]
+    const kpiRows: JSX.Element[][] = []
+    for (let i = 0; i < kpiItems.length; i += kpiCols) kpiRows.push(kpiItems.slice(i, i + kpiCols))
+
     // ----- 版面 -----
     return (
-      <Box flexDirection="column" gap={3} paddingX={1} paddingY={1}>
+      <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
         {/* 工具栏 */}
         <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" rowGap={1} columnGap={2}>
           <Box flexDirection="row" columnGap={1}>
@@ -754,10 +899,9 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               ? view.account === 'none'
                 ? '未归属的会话没有对应账号的额度'
                 : '发一条消息后显示'
-              : shownLimits[0]?.isLive
-                ? '实时'
-                : undefined
+              : undefined
           }
+          stat={shownLimits[0]?.isLive ? '实时' : undefined}
         >
           {shownLimits.map(r => (
             <Box key={`quota-${r.account}`} flexDirection="column" gap={1}>
@@ -772,19 +916,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           ))}
         </Section>
 
-        {/* 主数字：成本与 token 并列 */}
-        <Box flexDirection="column" gap={1}>
-          <Box flexDirection="row" flexWrap="wrap" columnGap={6} rowGap={1}>
-            {heroStat(`${RANGE_TITLE[view.range]} · 等价 API 成本`, fmtUsd(total.usd), delta)}
-            {heroStat('Token 消耗', fmtTokens(tokensOf(total)), tokenDelta)}
-          </Box>
-          <Text dimColor>
-            {active.length} 个会话 · {total.prompts} 次提问
-            {total.prompts > 0
-              ? ` · 每次提问 ${fmtUsd(total.usd / total.prompts)} / ${fmtTokens(Math.round(tokensOf(total) / total.prompts))} token`
-              : ''}{' '}
-            · 缓存命中 {pct(total.cr, prompted)}
-          </Text>
+        {/* KPI 宫格：一眼看清这段时间的规模、效率与活动量 */}
+        <Box flexDirection="column" gap={2}>
+          {kpiRows.map((cells, i) => (
+            <Box key={`kpi-row-${i}`} flexDirection="row" columnGap={2}>
+              {cells}
+            </Box>
+          ))}
           {scan.isRunning ? (
             <Text dimColor size="footnote">
               正在读取会话日志 {scan.doneFiles}/{scan.totalFiles}，数字会随扫描增加
@@ -795,7 +933,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         {/* 会话 */}
         <Section
           title="会话"
-          note={active.length > 0 ? `${active.length} 个 · 双击查看会话的上下文` : undefined}
+          note={
+            view.pick
+              ? `${sorted.length} 个用过${RANK_NOUN[view.pick.kind]}「${view.pick.key}」`
+              : active.length > 0
+                ? `${active.length} 个 · 双击查看会话的上下文`
+                : undefined
+          }
           right={
             <Box flexDirection="row" columnGap={1}>
               {SORTS.map(([s, label]) => (
@@ -810,8 +954,19 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
             </Box>
           }
         >
+          {view.pick ? (
+            <Button
+              key="clear-pick"
+              label={`✕ 清除筛选（${RANK_NOUN[view.pick.kind]}：${view.pick.key}）`}
+              plain
+              dimColor
+              onPress={() => setView(v => ({ ...v, pick: undefined }))}
+            />
+          ) : null}
           {active.length === 0 ? (
             <Text dimColor>{scan.isRunning ? '正在扫描…' : '这段时间没有会话。'}</Text>
+          ) : view.pick && sorted.length === 0 ? (
+            <Text dimColor>这段时间没有用过它的会话。</Text>
           ) : null}
           <Box flexDirection="column" gap={1}>
             {shownSessions.map(s => (
@@ -858,7 +1013,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               label={
                 view.showAllSessions
                   ? sorted.length > SESSIONS_MAX
-                    ? `收起（已显示最近 ${SESSIONS_MAX} 个，共 ${sorted.length} 个）`
+                    ? `收起（已显示前 ${SESSIONS_MAX} 个，共 ${sorted.length} 个）`
                     : '收起'
                   : sorted.length > SESSIONS_MAX
                     ? `显示前 ${SESSIONS_MAX} 个（共 ${sorted.length} 个）`
@@ -872,7 +1027,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         </Section>
 
         {/* 钱花在哪 */}
-        <Section title="钱花在哪">
+        <Section title="钱花在哪" stat={total.usd > 0 ? `合计 ${fmtUsd(total.usd)}` : undefined}>
           {Svg && total.usd > 0 ? (
             <Chart
               source={stackSvg(parts.map(p => ({ name: p.name, value: total.usdBy[p.key], color: p.color, note: fmtUsd(total.usdBy[p.key]) })), full)}
@@ -903,7 +1058,8 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         {/* 每日 */}
         <Section
           title="每日成本"
-          note={`今天 ${fmtUsd(series[series.length - 1]?.usd ?? 0)} / ${fmtTokens(series[series.length - 1]?.tokens ?? 0)} token · 日均 ${fmtUsd(dailyAverage(series))}${Svg ? ' · 悬停柱子看明细' : ''}`}
+          note={Svg ? '悬停柱子看明细' : undefined}
+          stat={`今天 ${fmtUsd(series[series.length - 1]?.usd ?? 0)} · 日均 ${fmtUsd(dailyAverage(series))}`}
         >
           {Svg ? (
             <Chart source={dailySvg(series, full)} alt={`最近 ${seriesDays} 天每日预估成本`} isInteractive />
@@ -919,7 +1075,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
 
         {/* 账号 */}
         {view.account === undefined && byAccount.size > 1 ? (
-          <Section title="账号">
+          <Section title="账号" stat={`合计 ${fmtUsd(accountTotal)}`}>
             {Svg ? (
               <Chart
                 source={stackSvg(
@@ -962,16 +1118,21 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
             onPress={() => setView(v => ({ ...v, showActivity: !v.showActivity }))}
           />
           {view.showActivity ? (
-            <Box flexDirection="column" gap={3}>
+            <Text dimColor size="footnote">
+              点排行里的一项，上方「会话」只列出用过它的会话；再点一次取消。「最近」按天记录，精确到当天。
+            </Text>
+          ) : null}
+          {view.showActivity ? (
+            <Box flexDirection="column" gap={4}>
               {/* 项目 + 时段 */}
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={3}>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="项目" note={rankNote(projRows.length, '按成本')}>
-                    {rankBlock('proj', projRows, v => fmtUsd(v))}
+                  <Section title="项目" note="按成本" stat={ranks.proj.size > 0 ? `${ranks.proj.size} 个` : undefined}>
+                    {rankList('proj', v => fmtUsd(v))}
                   </Section>
                 </Box>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="时段" note={total.req > 0 ? `最忙 ${busiest}:00–${busiest + 1}:00` : undefined}>
+                  <Section title="时段" stat={total.req > 0 ? `最忙 ${busiest}:00–${busiest + 1}:00` : undefined}>
                     {Svg ? (
                       <Chart source={hoursSvg(total.hours, half)} alt="按小时的请求分布" isInteractive />
                     ) : (
@@ -980,39 +1141,46 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                   </Section>
                 </Box>
               </Box>
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={3}>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
                   <Section
                     title="工具调用"
-                    note={rankNote(toolRows.length)}
+                    stat={rankStat('tool', '次')}
                     right={
                       <Button
                         key="toggle-mcp"
                         label={view.expandMcp ? '合并 MCP' : '展开 MCP'}
                         plain
                         dimColor
-                        onPress={() => setView(v => ({ ...v, expandMcp: !v.expandMcp }))}
+                        onPress={() =>
+                          setView(v => ({
+                            ...v,
+                            expandMcp: !v.expandMcp,
+                            // 合并/展开后工具名变了，原来点选的工具对不上
+                            pick: v.pick?.kind === 'tool' ? undefined : v.pick,
+                          }))
+                        }
                       />
                     }
                   >
-                    {rankBlock('tool', toolRows, count)}
+                    {rankList('tool', count)}
                   </Section>
                 </Box>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="命令" note={rankNote(progRows.length)}>
-                    {rankBlock('prog', progRows, count)}
+                  <Section title="命令" stat={rankStat('prog', '次')}>
+                    {rankList('prog', count)}
                   </Section>
                 </Box>
               </Box>
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={3}>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="技能" note={rankNote(skillRows.length)}>
-                    {rankBlock('skill', skillRows, count)}
+                  <Section title="技能" stat={rankStat('skill', '次')}>
+                    {rankList('skill', count)}
                   </Section>
                 </Box>
                 <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="模型" note={rankNote(modelRows.length, '按请求数')}>
-                    {rankBlock('model', modelRows, count)}
+                  <Section title="模型" note="按请求数" stat={rankStat('model', '次')}>
+                    {rankList('model', count)}
                   </Section>
                 </Box>
               </Box>
@@ -1037,6 +1205,7 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
   const els = $.ui.resolve(e)
   const { Box, Text } = els
   const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
+  const card = cardStyle(e.surface)
   const aggs = await read($, sessionsAtom)
   const accounts = await read($, accountsAtom)
   const detail = await read($, detailAtom)
@@ -1060,7 +1229,7 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
   const window = d && d.maxCtx > 200_000 ? 1_000_000 : 200_000
 
   const Section = (props: { title: string; note?: string; children?: unknown }) => (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column" gap={1} {...card}>
       <Box flexDirection="row" columnGap={1} alignItems="center">
         <Text weight="semibold">{props.title}</Text>
         {props.note ? (
@@ -1093,6 +1262,8 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
 
   const pctLoaded = d && d.totalBytes > 0 ? Math.round((d.doneBytes / d.totalBytes) * 100) : 0
   const trend = d ? d.requests.map(r => r.ctx) : []
+  const trendSvg = Svg && d && d.status === 'ready' && trend.length >= 2 ? contextTrendSvg(trend, window, undefined, full) : undefined
+  const trendSize = trendSvg ? svgSize(trendSvg) : undefined
   const topFiles = d
     ? Object.entries(d.files)
         .sort((a, b) => b[1].r + b[1].w - (a[1].r + a[1].w))
@@ -1100,7 +1271,7 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
     : []
 
   return (
-    <Box flexDirection="column" gap={3} paddingX={1} paddingY={1}>
+    <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
       {/* 标题 */}
       <Box flexDirection="column">
         <Text size="heading" weight="semibold" wrap="truncate-end">
@@ -1117,13 +1288,19 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
       {/* 上下文 */}
       {!file ? (
         // 主日志已被删、只剩子 Agent 日志：没有可还原的上下文，不能一直停在「读取中」
-        <Text dimColor>主会话日志已不存在，无法还原上下文，下方只有子 Agent 的用量。</Text>
+        <Box flexDirection="column" {...card}>
+          <Text dimColor>主会话日志已不存在，无法还原上下文，下方只有子 Agent 的用量。</Text>
+        </Box>
       ) : !d || d.status === 'loading' ? (
-        <Text dimColor>正在读取会话日志 {pctLoaded}%…</Text>
+        <Box flexDirection="column" {...card}>
+          <Text dimColor>正在读取会话日志 {pctLoaded}%…</Text>
+        </Box>
       ) : d.status === 'error' ? (
-        <Text color={ORANGE}>读取失败：{d.error}</Text>
+        <Box flexDirection="column" {...card}>
+          <Text color={ORANGE}>读取失败：{d.error}</Text>
+        </Box>
       ) : (
-        <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column" gap={1} {...card}>
           <Box flexDirection="row" justifyContent="space-between" alignItems="flex-end" columnGap={2}>
             <Text size="heading" weight="medium" tabular>
               最后上下文 {pct(d.lastCtx, window)}
@@ -1142,6 +1319,7 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
                 full,
               )}
               alt="最后一次请求的上下文占用"
+              width={full}
               height={Math.ceil(10 * 1.04) + 2}
               isInteractive
             />
@@ -1161,11 +1339,12 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
           title="上下文趋势"
           note={`${d.requestCount} 次请求${d.requestCount > d.requests.length ? `，抽样 ${d.requests.length} 个点` : ''}`}
         >
-          {Svg ? (
+          {Svg && trendSvg && trendSize ? (
             <Svg
-              source={contextTrendSvg(trend, window, undefined, full)}
+              source={trendSvg}
               alt="逐请求上下文大小"
-              height={Math.ceil(svgSize(contextTrendSvg(trend, window, undefined, full)).height * 1.04) + 2}
+              width={trendSize.width}
+              height={Math.ceil(trendSize.height * 1.04) + 2}
               isInteractive
             />
           ) : (

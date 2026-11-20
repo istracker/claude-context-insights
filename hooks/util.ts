@@ -93,14 +93,38 @@ export function sparkline(values: number[], max: number): string {
 }
 
 /**
- * 面板正文的像素宽度估算：插件只拿得到能放多少个字符（bodyColumns）。
- * 估大了宿主会把图整体缩小、而框高不变，底部就被裁掉（实测按 8px 估时约缩 7%），
- * 所以宁小勿大：按每字符约 7.3px 估，再扣掉左右内边距。
+ * 区块卡片：圆角细边框加内边距（参考 dsh-context 的卡片布局，让区块之间界线分明）。
+ * 终端画成字符边框，桌面端画成圆角描边。
+ */
+export const CARD = { borderStyle: 'round', borderDimColor: true, paddingX: 'md', paddingY: 'sm' } as const
+
+/**
+ * 按绘制端取卡片样式。暗色背景上主题的 inactive 描边和过低的灰底几乎融进背景，
+ * 所以用中性半透明灰描边 + 浅灰底（深浅主题下都有清晰界线）；终端仍是字符边框。
+ */
+export function cardStyle(surface: string) {
+  if (surface === 'terminal') return CARD
+  return {
+    borderStyle: 'round',
+    borderColor: 'rgba(127,127,127,0.32)',
+    backgroundColor: 'rgba(127,127,127,0.10)',
+    paddingX: 'md',
+    paddingY: 'sm',
+  } as const
+}
+/** 卡片的边框加左右内边距大约占掉的像素，图表要比面板窄这么多 */
+const CARD_INSET = 40
+
+/**
+ * 卡片里图表的像素宽度估算：插件只拿得到能放多少个字符（bodyColumns）。
+ * 图表都显式给了宽度，估大了右侧会被裁、估小了只是右边留白，所以宁小勿大：
+ * 按每字符约 7.3px 估，扣掉面板左右内边距，再扣掉卡片的边框与内边距。
  */
 export function paneWidths(bodyColumns: number): { full: number; half: number } {
-  const full = Math.max(280, Math.round(bodyColumns * 7.3) - 24)
-  // 两栏并排（每栏至少 30 字符 + 间距）时各取一半
-  const half = bodyColumns >= 64 ? Math.floor((full - 32) / 2) : full
+  const body = Math.round(bodyColumns * 7.3) - 24
+  const full = Math.max(240, body - CARD_INSET)
+  // 两栏并排（每栏卡片至少 200px 图表 + 40px 边框内边距，加上栏间距 32px，共需 ~512px ≈ 74 列）
+  const half = bodyColumns >= 74 ? Math.floor((body - 32) / 2) - CARD_INSET : full
   return { full, half }
 }
 
@@ -135,6 +159,14 @@ export function fmtAgo(ms: number): string {
   const h = Math.floor(m / 60)
   if (h < 24) return `${h} 小时前`
   const d = Math.floor(h / 24)
+  return `${d} 天前`
+}
+
+/** 按天粒度的相对时间：「今天」「昨天」「3 天前」（用于按天统计的排行） */
+export function fmtDayAgo(day: string, today: string): string {
+  const d = Math.round((Date.parse(today + 'T00:00:00Z') - Date.parse(day + 'T00:00:00Z')) / 86_400_000)
+  if (Number.isNaN(d) || d <= 0) return '今天'
+  if (d === 1) return '昨天'
   return `${d} 天前`
 }
 
