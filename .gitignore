@@ -1,0 +1,5 @@
+# 引擎加载插件时自动生成的类型声明，不入库
+.claude-plugin/types/
+
+.DS_Store
+node_modules/

@@ -1,0 +1,106 @@
+// 两个面板共用的格式化与小工具
+
+/** 取 Bash 命令的主程序名：跳过 cd/环境变量赋值，去掉路径 */
+export function programOf(command: string): string | undefined {
+  const segments = command.split(/&&|\|\||;|\|/)
+  for (const raw of segments) {
+    const words = raw.trim().split(/\s+/).filter(Boolean)
+    while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] ?? '')) words.shift()
+    const head = words[0]
+    if (head === undefined || head === 'cd' || head === 'sudo' || head === 'env') continue
+    return head.replace(/^.*\//, '')
+  }
+  return undefined
+}
+
+export function bump(map: Record<string, number>, key: string, by = 1): Record<string, number> {
+  return { ...map, [key]: (map[key] ?? 0) + by }
+}
+
+export function fmtTokens(n: number | undefined): string {
+  if (n === undefined) return '—'
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B'
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
+  if (n >= 10_000) return Math.round(n / 1000) + 'k'
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k'
+  return String(n)
+}
+
+export function fmtUsd(n: number | undefined): string {
+  if (n === undefined) return '—'
+  if (n >= 100) return '$' + n.toFixed(0)
+  return n < 1 ? '$' + n.toFixed(3) : '$' + n.toFixed(2)
+}
+
+export function pct(part: number, whole: number): string {
+  return whole > 0 ? ((part / whole) * 100).toFixed(1) + '%' : '—'
+}
+
+export function topEntries(map: Record<string, number>, n: number): [string, number][] {
+  return Object.entries(map)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+}
+
+/** 文字进度条 */
+export function textBar(percent: number, width: number): string {
+  const filled = Math.max(0, Math.min(width, Math.round((percent / 100) * width)))
+  return '█'.repeat(filled) + '░'.repeat(width - filled)
+}
+
+/** 终端里用的迷你趋势条 */
+export function sparkline(values: number[], max: number): string {
+  const bars = '▁▂▃▄▅▆▇█'
+  return values
+    .map(v => bars[Math.min(bars.length - 1, Math.floor((v / Math.max(max, 1)) * bars.length))] ?? '▁')
+    .join('')
+}
+
+/**
+ * 面板正文的像素宽度估算：插件只拿得到能放多少个字符（bodyColumns）。
+ * 估大了宿主会把图整体缩小、而框高不变，底部就被裁掉（实测按 8px 估时约缩 7%），
+ * 所以宁小勿大：按每字符约 7.3px 估，再扣掉左右内边距。
+ */
+export function paneWidths(bodyColumns: number): { full: number; half: number } {
+  const full = Math.max(280, Math.round(bodyColumns * 7.3) - 24)
+  // 两栏并排（每栏至少 30 字符 + 间距）时各取一半
+  const half = bodyColumns >= 64 ? Math.floor((full - 32) / 2) : full
+  return { full, half }
+}
+
+/** 订阅额度窗口的中文名 */
+export function windowLabel(kind: string): string {
+  const names: Record<string, string> = {
+    five_hour: '5 小时',
+    seven_day: '7 天',
+    seven_day_opus: '7 天 · Opus',
+    seven_day_sonnet: '7 天 · Sonnet',
+    spend_limit: '消费上限',
+  }
+  return names[kind] ?? kind
+}
+
+/** 距某时刻还有多久：「2 小时 10 分」「3 天」 */
+export function fmtUntil(ms: number): string {
+  if (ms <= 60_000) return '1 分钟内'
+  const m = Math.floor(ms / 60_000)
+  if (m < 60) return `${m} 分钟`
+  const h = Math.floor(m / 60)
+  if (h < 24) return m % 60 === 0 ? `${h} 小时` : `${h} 小时 ${m % 60} 分`
+  const d = Math.floor(h / 24)
+  return h % 24 === 0 ? `${d} 天` : `${d} 天 ${h % 24} 小时`
+}
+
+export function fmtAgo(ms: number): string {
+  const m = Math.floor(ms / 60_000)
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} 小时前`
+  const d = Math.floor(h / 24)
+  return `${d} 天前`
+}
+
+export function escapeXml(s: string): string {
+  return s.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c] ?? c)
+}

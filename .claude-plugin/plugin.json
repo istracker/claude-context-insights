@@ -1,0 +1,6 @@
+{
+  "name": "cc-context-insights",
+  "version": "0.1.0",
+  "description": "专为 Claude Code / Claude Desktop 设计的上下文洞察面板：订阅额度、成本与 token、会话与活动，双击会话查看它的上下文（非官方）",
+  "types": "./types/index.d.ts"
+}
