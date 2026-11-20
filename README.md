@@ -23,6 +23,24 @@
 
 口径：一次 API 响应在日志中拆成多行，按 requestId 去重。成本取每个会话日志里 `cost-state` 记录的本地估算，按 Claude 标价比例（5 分钟 / 1 小时缓存写 1.25 / 2 倍、缓存读 0.1 倍、输出 5 倍）摊到各天与各类；进行中或恢复过的会话没有最新 `cost-state`，按同模型已结束会话学到的单价估算，标「≈」。会话与账号的对应取自 Claude Desktop 的 `claude-code-sessions/<账号>/<组织>/local_*.json`（含 `priorCliSessionIds`），账号别名可写在 `~/.claude/cc-context-insights/accounts.json`。首次扫描全量读取，之后按字节偏移只读新增部分，结果缓存在插件的 `$.store` 中。
 
+## 安装
+
+从 GitHub 安装：
+
+```bash
+claude plugin install cc-context-insights --marketplace istracker/claude-context-insights
+```
+
+在 Claude Code 会话里也可以用 `/plugin install cc-context-insights --marketplace istracker/claude-context-insights`。
+
+从本地克隆的仓库安装（插件直接读取该目录，改代码后执行 `claude plugin update cc-context-insights@cc-context-insights-local` 并新开会话生效）：
+
+```bash
+claude plugin install cc-context-insights --marketplace /path/to/claude-context-insights
+```
+
+安装后新开一个会话才会加载。
+
 ## 使用
 
 面板在会话开始时自动打开，显示总览。关掉后用唯一的命令重新打开：
