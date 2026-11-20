@@ -1,13 +1,46 @@
 // 两个面板共用的格式化与小工具
 
-/** 取 Bash 命令的主程序名：跳过 cd/环境变量赋值，去掉路径 */
+/** 命令前缀：跳过它们，取后面真正执行的程序 */
+const COMMAND_PREFIXES = new Set(['sudo', 'env', 'command', 'exec', 'time', 'nohup'])
+
+/** 取 Bash 命令的主程序名：跳过注释、cd、环境变量赋值和 sudo/env 等前缀，去掉路径 */
 export function programOf(command: string): string | undefined {
-  const segments = command.split(/&&|\|\||;|\|/)
+  const segments = command
+    .split('\n')
+    .filter(line => !line.trim().startsWith('#'))
+    .join('\n')
+    .split(/&&|\|\||;|\||\n/)
   for (const raw of segments) {
-    const words = raw.trim().split(/\s+/).filter(Boolean)
-    while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] ?? '')) words.shift()
+    // 子 shell 的括号不是命令的一部分：(cd x && git status)
+    const words = raw.trim().replace(/^[({]+\s*/, '').split(/\s+/).filter(Boolean)
+    for (;;) {
+      const w = words[0]
+      if (w === undefined) break
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+        // FOO="a b" 带引号的值可能被空白拆成多段，跳到引号闭合处
+        const quote = /^[A-Za-z_][A-Za-z0-9_]*=(["'])/.exec(w)?.[1]
+        words.shift()
+        const value = quote ? w.slice(w.indexOf(quote) + 1) : ''
+        if (quote && !(value.length > 0 && value.endsWith(quote))) {
+          while (words.length > 0 && !(words.shift() ?? '').endsWith(quote)) {
+            // 继续跳过引号内的部分
+          }
+        }
+        continue
+      }
+      if (COMMAND_PREFIXES.has(w)) {
+        words.shift()
+        // 前缀自带的选项：sudo -u root、env -i；-u/-g/-C 等还带一个参数
+        while (words.length > 0 && (words[0] ?? '').startsWith('-')) {
+          const opt = words.shift() ?? ''
+          if (/^-[ugCphrt]$/.test(opt)) words.shift()
+        }
+        continue
+      }
+      break
+    }
     const head = words[0]
-    if (head === undefined || head === 'cd' || head === 'sudo' || head === 'env') continue
+    if (head === undefined || head === 'cd') continue
     return head.replace(/^.*\//, '')
   }
   return undefined
@@ -18,7 +51,9 @@ export function bump(map: Record<string, number>, key: string, by = 1): Record<s
 }
 
 export function fmtTokens(n: number | undefined): string {
-  if (n === undefined) return '—'
+  if (n === undefined || Number.isNaN(n)) return '—'
+  // 上下文压缩后的变化量是负数
+  if (n < 0) return '-' + fmtTokens(-n)
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B'
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
   if (n >= 10_000) return Math.round(n / 1000) + 'k'
@@ -82,6 +117,7 @@ export function windowLabel(kind: string): string {
 
 /** 距某时刻还有多久：「2 小时 10 分」「3 天」 */
 export function fmtUntil(ms: number): string {
+  if (Number.isNaN(ms)) return '—'
   if (ms <= 60_000) return '1 分钟内'
   const m = Math.floor(ms / 60_000)
   if (m < 60) return `${m} 分钟`

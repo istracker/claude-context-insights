@@ -404,7 +404,8 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
         const prog = cmd ? programOf(cmd) : undefined
         if (prog) programs = bump(programs, prog)
       }
-      const path = str(input?.file_path)
+      // NotebookEdit 的路径参数叫 notebook_path
+      const path = str(input?.file_path) ?? str(input?.notebook_path)
       if (path && FILE_TOOLS.has(name)) {
         const f = files[path] ?? { r: 0, w: 0 }
         files[path] = WRITE_FILE_TOOLS.has(name) ? { r: f.r, w: f.w + 1 } : { r: f.r + 1, w: f.w }

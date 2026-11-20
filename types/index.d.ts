@@ -11,6 +11,15 @@ export type StepRecord = {
   tools: number
 }
 
+/** 整个会话的请求累计（steps 只保留最近若干条，统计不随之截断） */
+export type StepTotals = {
+  count: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
 /** 工具、文件、命令活动计数（含子 Agent） */
 export type Activity = {
   tools: Record<string, number>
@@ -183,6 +192,7 @@ declare module 'claude-code' {
   interface PluginState {
     'cc-context-insights': {
       steps: Shaped<StepRecord[]>
+      'step-totals': Shaped<StepTotals>
       turns: Shaped<number>
       activity: Shaped<Activity>
       snapshot: Shaped<Snapshot | null>

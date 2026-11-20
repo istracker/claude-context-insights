@@ -9,6 +9,7 @@ import type {
   RateWindow,
   Snapshot,
   StepRecord,
+  StepTotals,
 } from '../types'
 import { ACCENT, BLUE, GREY, ORANGE, PALETTE, contextTrendSvg, stackSvg, svgSize } from './charts'
 import { groupTools, renderInsights, renderSessionDetail, startInsights } from './insights'
@@ -53,6 +54,11 @@ async function renderMain($: EngineInterface, e: PaneInput): Promise<JSX.Element
 const steps = atom({ plugin: 'cc-context-insights', key: 'steps' } as const, [] as StepRecord[], {
   shape: 'steps-1',
 })
+/** 整个会话的请求累计：steps 只留最近 MAX_STEPS 条画趋势，统计数字不能跟着截断 */
+const NO_TOTALS: StepTotals = { count: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+const stepTotals = atom({ plugin: 'cc-context-insights', key: 'step-totals' } as const, NO_TOTALS, {
+  shape: 'step-totals-1',
+})
 const turns = atom({ plugin: 'cc-context-insights', key: 'turns' } as const, 0, { shape: 'turns-1' })
 const EMPTY_ACTIVITY: Activity = {
   tools: {},
@@ -82,11 +88,18 @@ export const LIMITS_STORE_KEY = 'limits-1'
 /** 记下当前账号这一刻的额度 */
 async function saveLimits($: EngineInterface, windows: RateWindow[], at: number): Promise<void> {
   if (windows.length === 0) return
-  const account = (await read($, accountsAtom)).current ?? 'current'
+  const account = (await read($, accountsAtom)).current
+  if (account === undefined) {
+    // 账号还没加载完（会话刚开始时扫描尚未跑到 loadAccounts）：只放进本会话状态，
+    // 不落到 $.store，免得在兜底键下留一份永远不会被读的旧读数
+    await update($, limitsAtom, cur => ({ ...cur, current: { at, windows } }))
+    return
+  }
   const stored = ((await $.store.get(LIMITS_STORE_KEY)) ?? {}) as Record<string, RateSnapshot>
-  const next = { ...stored, [account]: { at, windows } }
+  const { current: _stale, ...rest } = stored
+  const next = { ...rest, [account]: { at, windows } }
   await $.store.set(LIMITS_STORE_KEY, next)
-  await update($, limitsAtom, () => next)
+  await update($, limitsAtom, cur => ({ ...cur, ...next }))
 }
 
 // ---------- 工具调用归类 ----------
@@ -98,8 +111,15 @@ const SEARCH_TOOLS = new Set(['Grep', 'Glob', 'WebSearch', 'ToolSearch'])
 
 // ---------- 刷新上下文快照 ----------
 
+/** 正在刷新时又要求精确统计：记下来，本次结束后补做，不能丢 */
+let pendingFull = false
+
 async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<void> {
-  if (await read($, busy)) return
+  if (await read($, busy)) {
+    if (detail === 'full') pendingFull = true
+    return
+  }
+  if (detail === 'full') pendingFull = false
   await update($, busy, () => true)
   try {
     const usage = await $.session.usage({ breakdown: detail })
@@ -135,6 +155,10 @@ async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<
     $.ui.log(`${PLUGIN}: 刷新失败 ${String(err)}`)
   } finally {
     await update($, busy, () => false)
+    if (pendingFull) {
+      pendingFull = false
+      void refresh($, 'full')
+    }
   }
 }
 
@@ -190,6 +214,13 @@ export const register: Register = on => {
         tools: result.toolUses.length,
       }
       await update($, steps, list => [...list, rec].slice(-MAX_STEPS))
+      await update($, stepTotals, t => ({
+        count: t.count + 1,
+        input: t.input + rec.input,
+        output: t.output + rec.output,
+        cacheRead: t.cacheRead + rec.cacheRead,
+        cacheWrite: t.cacheWrite + rec.cacheWrite,
+      }))
     }
     return result
   })
@@ -208,7 +239,13 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const name = String(e.tool)
     const args = e as unknown as Record<string, unknown>
-    const path = typeof args.file_path === 'string' ? args.file_path : undefined
+    // NotebookEdit 的路径参数叫 notebook_path
+    const path =
+      typeof args.file_path === 'string'
+        ? args.file_path
+        : typeof args.notebook_path === 'string'
+          ? args.notebook_path
+          : undefined
     const command = typeof args.command === 'string' ? args.command : undefined
     const ran = await next(e)
     // 统计失败不能影响工具结果
@@ -253,20 +290,17 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
     const isBusy = await read($, busy)
     const agents = await $.agent.list().catch(() => [])
     const now = await $.clock.now()
-    const myLimits = (await read($, limitsAtom))[(await read($, accountsAtom)).current ?? 'current']
+    const allLimits = await read($, limitsAtom)
+    const myAccount = (await read($, accountsAtom)).current
+    // 账号加载前的读数暂记在 'current' 下（只在本会话状态里）
+    const mine = myAccount !== undefined ? allLimits[myAccount] : undefined
+    const early = allLimits.current
+    const myLimits = mine && early ? (early.at > mine.at ? early : mine) : (mine ?? early)
     const cols = e.props.bodyColumns
     const { full } = paneWidths(cols)
 
     // ----- 数据 -----
-    const sum = list.reduce(
-      (s, r) => ({
-        input: s.input + r.input,
-        output: s.output + r.output,
-        cacheRead: s.cacheRead + r.cacheRead,
-        cacheWrite: s.cacheWrite + r.cacheWrite,
-      }),
-      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    )
+    const sum = await read($, stepTotals)
     const prompted = sum.input + sum.cacheRead + sum.cacheWrite
     const last = list[list.length - 1]
     const prev = list[list.length - 2]
@@ -386,16 +420,25 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
           {myLimits && myLimits.windows.length > 0 ? (
             <Text size="footnote">
               <Text dimColor>订阅额度 </Text>
-              {myLimits.windows.map((w, i) => (
-                <Text key={`lim-${w.kind}`}>
-                  {i > 0 ? <Text dimColor> · </Text> : null}
-                  <Text dimColor>{windowLabel(w.kind)} </Text>
-                  <Text color={w.percentUsed >= 80 ? ORANGE : undefined} weight="medium">
-                    {w.percentUsed}%
+              {myLimits.windows.map((w, i) => {
+                // 与总览一致：重置时间已过的读数作废，非法时间不显示
+                const resetAt = w.resetsAt ? Date.parse(w.resetsAt) : NaN
+                const isReset = !Number.isNaN(resetAt) && resetAt <= now
+                return (
+                  <Text key={`lim-${w.kind}`}>
+                    {i > 0 ? <Text dimColor> · </Text> : null}
+                    <Text dimColor>{windowLabel(w.kind)} </Text>
+                    <Text color={!isReset && w.percentUsed >= 80 ? ORANGE : undefined} dimColor={isReset} weight="medium">
+                      {isReset ? '—' : `${w.percentUsed}%`}
+                    </Text>
+                    {isReset ? (
+                      <Text dimColor>（已重置）</Text>
+                    ) : Number.isNaN(resetAt) ? null : (
+                      <Text dimColor>（{fmtUntil(resetAt - now)}后重置）</Text>
+                    )}
                   </Text>
-                  {w.resetsAt ? <Text dimColor>（{fmtUntil(Date.parse(w.resetsAt) - now)}后重置）</Text> : null}
-                </Text>
-              ))}
+                )
+              })}
             </Text>
           ) : null}
           <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2} flexWrap="wrap">
@@ -436,7 +479,7 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
           <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={1}>
             {stat('等价 API 成本', fmtUsd(snap?.usd))}
             {stat('轮次', String(turnCount))}
-            {stat('请求', String(list.length))}
+            {stat('请求', String(sum.count))}
             {stat('缓存命中', pct(sum.cacheRead, prompted))}
             {stat('输出', fmtTokens(sum.output))}
           </Box>

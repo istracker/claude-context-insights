@@ -92,8 +92,8 @@ test('面板在四种绘制端都能画出组成、成本、额度和命令统�
     expect((await ui.find({ type: 'Text', text: /2 小时后重置/ }))?.text).toContain('2 小时后重置')
     await ui.unmount()
   }
-  // 快照按账号存进了跨会话的 $.store
-  expect(Object.keys((store.get('limits-1') ?? {}) as object)).toEqual(['current'])
+  // 账号未知时读数只留在本会话状态，不落到跨会话的 $.store（避免留下无主的旧读数）
+  expect(Object.keys((store.get('limits-1') ?? {}) as object)).toEqual([])
 })
 
 test('面板默认是洞察总览，没有顶部标签；返回按钮从会话回到总览', async ($, on) => {

@@ -202,18 +202,24 @@ export function mergeSessions(aggs: SessionAgg[]): MergedSession[] {
     groups.push({ id, main, days, lastAt, model, subW })
   }
 
-  // 学习每个模型的「美元 / 计费权重」
-  const learned = new Map<string, { usd: number; w: number }>()
+  // 学习每个模型的「美元 / 计费权重」。
+  // cost-state 的总成本包含子 Agent 的花费，而 costAtWeight 只是主会话的权重：
+  // 有子 Agent 的会话直接拿来学会把单价抬高。所以优先只用没有子 Agent 的会话（口径干净）；
+  // 某个模型只有带子 Agent 的样本时，才退而用它们，并把子 Agent 权重算进分母。
+  const clean = new Map<string, { usd: number; w: number }>()
+  const mixed = new Map<string, { usd: number; w: number }>()
   for (const g of groups) {
-    const w = g.main.costAtWeight ?? 0
-    if (g.main.costUsd === undefined || w <= 0) continue
+    const mainW = g.main.isSub ? 0 : (g.main.costAtWeight ?? 0)
+    if (g.main.costUsd === undefined || mainW <= 0) continue
+    const target = g.subW > 0 ? mixed : clean
+    const w = mainW + g.subW
     for (const k of [g.model, '*']) {
-      const cur = learned.get(k) ?? { usd: 0, w: 0 }
-      learned.set(k, { usd: cur.usd + g.main.costUsd, w: cur.w + w })
+      const cur = target.get(k) ?? { usd: 0, w: 0 }
+      target.set(k, { usd: cur.usd + g.main.costUsd, w: cur.w + w })
     }
   }
   const rateOf = (model: string): number | undefined => {
-    const r = learned.get(model) ?? learned.get('*')
+    const r = clean.get(model) ?? mixed.get(model) ?? clean.get('*') ?? mixed.get('*')
     return r && r.w > 0 ? r.usd / r.w : undefined
   }
 
@@ -404,7 +410,8 @@ export async function startInsights($: EngineInterface): Promise<void> {
   })
   // 各账号上次的额度读数存在 $.store（跨会话），载入到本会话状态
   const stored = (await $.store.get(LIMITS_STORE_KEY)) as Record<string, RateSnapshot> | undefined
-  if (stored && typeof stored === 'object') await update($, limitsAtom, () => stored)
+  // 与 refresh 并发：已有的（更新的）读数优先，旧读数只补缺
+  if (stored && typeof stored === 'object') await update($, limitsAtom, cur => ({ ...stored, ...cur }))
   void runScan($)
 }
 
@@ -498,7 +505,8 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     for (const [k, v] of Object.entries(storedLimits)) {
       if (k !== currentId && k !== 'current') limitRows.push({ ...v, account: k, isLive: false })
     }
-    const shownLimits = view.account && view.account !== 'none' ? limitRows.filter(r => r.account === view.account) : limitRows
+    // 「未归属」的会话不属于任何账号，没有额度可显示
+    const shownLimits = view.account === undefined ? limitRows : limitRows.filter(r => r.account === view.account)
 
     const seriesDays = view.range === '30d' || view.range === 'all' ? 30 : 7
     const series: DayPoint[] = []
@@ -524,7 +532,8 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     /** 会话 id → 主日志文件（双击后从它还原上下文） */
     const mainFiles = new Map(aggs.filter(a => !a.isSub).map(a => [a.id, a.file] as const))
     const currentSessionId = await $.session.id().catch(() => undefined)
-    const shownSessions = view.showAllSessions ? sorted.slice(0, 40) : sorted.slice(0, 6)
+    const SESSIONS_MAX = 40
+    const shownSessions = view.showAllSessions ? sorted.slice(0, SESSIONS_MAX) : sorted.slice(0, 6)
 
     // ----- 小组件 -----
     const Section = (props: { title: string; note?: string; right?: JSX.Element | null; children?: unknown }) => (
@@ -730,7 +739,15 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         {/* 订阅额度：重度用户最关心会不会撞上限 */}
         <Section
           title="订阅额度"
-          note={shownLimits.length === 0 ? '发一条消息后显示' : shownLimits[0]?.isLive ? '实时' : undefined}
+          note={
+            shownLimits.length === 0
+              ? view.account === 'none'
+                ? '未归属的会话没有对应账号的额度'
+                : '发一条消息后显示'
+              : shownLimits[0]?.isLive
+                ? '实时'
+                : undefined
+          }
         >
           {shownLimits.map(r => (
             <Box key={`quota-${r.account}`} flexDirection="column" gap={1}>
@@ -828,7 +845,15 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           {sorted.length > 6 ? (
             <Button
               key="more-sessions"
-              label={view.showAllSessions ? '收起' : `显示全部 ${sorted.length} 个`}
+              label={
+                view.showAllSessions
+                  ? sorted.length > SESSIONS_MAX
+                    ? `收起（已显示最近 ${SESSIONS_MAX} 个，共 ${sorted.length} 个）`
+                    : '收起'
+                  : sorted.length > SESSIONS_MAX
+                    ? `显示前 ${SESSIONS_MAX} 个（共 ${sorted.length} 个）`
+                    : `显示全部 ${sorted.length} 个`
+              }
               plain
               dimColor
               onPress={() => setView(v => ({ ...v, showAllSessions: !v.showAllSessions }))}
@@ -1080,7 +1105,10 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
       </Box>
 
       {/* 上下文 */}
-      {!d || d.status === 'loading' ? (
+      {!file ? (
+        // 主日志已被删、只剩子 Agent 日志：没有可还原的上下文，不能一直停在「读取中」
+        <Text dimColor>主会话日志已不存在，无法还原上下文，下方只有子 Agent 的用量。</Text>
+      ) : !d || d.status === 'loading' ? (
         <Text dimColor>正在读取会话日志 {pctLoaded}%…</Text>
       ) : d.status === 'error' ? (
         <Text color={ORANGE}>读取失败：{d.error}</Text>
@@ -1151,7 +1179,7 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
 
       {/* 活动 */}
       {d && d.status === 'ready' && Object.keys(d.tools).length > 0 ? (
-        <Section title="活动" note={`${Object.values(d.tools).reduce((a, b) => a + b, 0)} 次工具调用`}>
+        <Section title="活动" note={`主会话 ${Object.values(d.tools).reduce((a, b) => a + b, 0)} 次工具调用（不含子 Agent）`}>
           <Text>
             {topEntries(groupTools(d.tools), 5)
               .map(([k, v]) => `${k} ${v}`)
