@@ -5,6 +5,7 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 import type {
   AccountMap,
   DayAgg,
+  FileFilter,
   InsightRange,
   InsightSort,
   InsightView,
@@ -38,7 +39,9 @@ import type { DayPoint, HeatDay } from './charts'
 import {
   bump,
   cardStyle,
+  filterFiles,
   fmtAgo,
+  fmtClockTime,
   fmtDayAgo,
   fmtTokens,
   fmtUntil,
@@ -47,6 +50,7 @@ import {
   pct,
   sameAccountWindows,
   sessionAccount,
+  shortFilePath,
   sparkline,
   textBar,
   topEntries,
@@ -78,7 +82,7 @@ const focusAtom = atom({ plugin: 'cc-context-insights', key: 'focus' } as const,
   shape: 'focus-1',
 })
 const detailAtom = atom({ plugin: 'cc-context-insights', key: 'detail' } as const, null as SessionDetail | null, {
-  shape: 'detail-1',
+  shape: 'detail-2',
 })
 
 // ---------- 双击会话 ----------
@@ -93,6 +97,7 @@ async function pressSession($: EngineInterface, id: string, file: string | undef
   const isDouble = lastPress !== undefined && lastPress.id === id && now - lastPress.at <= DOUBLE_MS
   lastPress = isDouble ? undefined : { id, at: now }
   if (!isDouble) return
+  await update($, viewAtom, v => ({ ...v, fileFilter: undefined, showAllFiles: false }))
   await update($, focusAtom, () => id)
   const current = await $.session.id().catch(() => undefined)
   if (id !== current && file) {
@@ -1405,14 +1410,19 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
  */
 export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: string): Promise<JSX.Element> {
   const els = $.ui.resolve(e)
-  const { Box, Text } = els
+  const { Box, Text, Button } = els
   const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
   const card = cardStyle(e.surface)
   const aggs = await read($, sessionsAtom)
   const accounts = await read($, accountsAtom)
   const detail = await read($, detailAtom)
+  const scan = await read($, scanAtom)
+  const view = await read($, viewAtom)
   const now = await $.clock.now()
-  const { full } = paneWidths(e.props.bodyColumns)
+  const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
+  const cols = e.props.bodyColumns
+  const { full } = paneWidths(cols)
+  const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
 
   const all = mergeSessions(aggs)
   const s = all.find(x => x.id === id)
@@ -1430,15 +1440,18 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
   // 历史会话不知道当时的窗口大小：超过 200k 说明是 1M 窗口
   const window = d && d.maxCtx > 200_000 ? 1_000_000 : 200_000
 
-  const Section = (props: { title: string; note?: string; children?: unknown }) => (
+  const Section = (props: { title: string; note?: string; right?: JSX.Element | null; children?: unknown }) => (
     <Box flexDirection="column" gap={1} {...card}>
-      <Box flexDirection="row" columnGap={1} alignItems="center">
-        <Text weight="semibold">{props.title}</Text>
-        {props.note ? (
-          <Text dimColor size="footnote">
-            {props.note}
-          </Text>
-        ) : null}
+      <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
+        <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1}>
+          <Text weight="semibold">{props.title}</Text>
+          {props.note ? (
+            <Text dimColor size="footnote">
+              {props.note}
+            </Text>
+          ) : null}
+        </Box>
+        {props.right ?? null}
       </Box>
       {props.children as JSX.Element}
     </Box>
@@ -1466,11 +1479,20 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
   const trend = d ? d.requests.map(r => r.ctx) : []
   const trendSvg = Svg && d && d.status === 'ready' && trend.length >= 2 ? contextTrendSvg(trend, window, undefined, full) : undefined
   const trendSize = trendSvg ? svgSize(trendSvg) : undefined
-  const topFiles = d
-    ? Object.entries(d.files)
-        .sort((a, b) => b[1].r + b[1].w - (a[1].r + a[1].w))
-        .slice(0, 5)
-    : []
+  const drops = d?.drops ?? []
+  const fileFilter: FileFilter = view.fileFilter ?? 'all'
+  const allFileEntries = d ? Object.entries(d.files) : []
+  const readFileCount = allFileEntries.filter(([, f]) => f.r > 0).length
+  const writeFileCount = allFileEntries.filter(([, f]) => f.w > 0).length
+  const filteredFiles = d ? filterFiles(d.files, fileFilter) : []
+  const FILES_VISIBLE = 6
+  const FILES_MAX = 30
+  const shownFiles = view.showAllFiles ? filteredFiles.slice(0, FILES_MAX) : filteredFiles.slice(0, FILES_VISIBLE)
+  const fileFilters: [FileFilter, string][] = [
+    ['all', `全部 ${allFileEntries.length}`],
+    ['read', `读 ${readFileCount}`],
+    ['write', `写 ${writeFileCount}`],
+  ]
 
   return (
     <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
@@ -1526,7 +1548,7 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
               isInteractive
             />
           ) : (
-            <Text color={ACCENT}>{textBar((d.lastCtx / window) * 100, 30)}</Text>
+            <Text color={ACCENT}>{textBar((d.lastCtx / window) * 100, Math.max(10, Math.min(40, cols - 4)))}</Text>
           )}
           <Text dimColor size="footnote">
             峰值 {fmtTokens(d.maxCtx)} · {d.requestCount} 次请求 · 上下文骤降（压缩或清空）{d.compactions} 次 · 窗口按{' '}
@@ -1550,8 +1572,36 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
               isInteractive
             />
           ) : (
-            <Text color={ACCENT}>{sparkline(trend.slice(-60), window)}</Text>
+            <Text color={ACCENT}>{sparkline(trend.slice(-Math.max(10, cols - 4)), window)}</Text>
           )}
+        </Section>
+      ) : null}
+
+      {/* 上下文事件（骤降明细） */}
+      {d && d.status === 'ready' && drops.length > 0 ? (
+        <Section
+          title="上下文事件"
+          note={`压缩或清空 · 共 ${drops.length} 次${drops.length > 10 ? '（显示最近 10 次）' : ''}`}
+        >
+          <Box flexDirection="column" gap={1}>
+            {drops
+              .slice(-10)
+              .reverse()
+              .map(ev => (
+                <Box key={`drop-${ev.step}-${ev.at}`} flexDirection="row" justifyContent="space-between" columnGap={2}>
+                  <Text dimColor size="footnote" tabular>
+                    第 {ev.step} 次请求 · {fmtClockTime(ev.at, tzMin)}
+                  </Text>
+                  <Text tabular size="footnote">
+                    <Text dimColor>{fmtTokens(ev.from)} → </Text>
+                    <Text color={ORANGE} weight="medium">
+                      {fmtTokens(ev.to)}
+                    </Text>
+                    <Text dimColor>（-{pct(ev.from - ev.to, ev.from)}）</Text>
+                  </Text>
+                </Box>
+              ))}
+          </Box>
         </Section>
       ) : null}
 
@@ -1576,16 +1626,57 @@ export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: 
               .map(([k, v]) => `${k} ${v}`)
               .join(' · ')}
           </Text>
-          {topFiles.length > 0 ? (
-            <Box flexDirection="column">
-              {topFiles.map(([p, f]) => (
-                <Box key={`dfile-${p}`} flexDirection="row" justifyContent="space-between" columnGap={2}>
-                  <Text wrap="truncate-start">{p.split('/').slice(-2).join('/')}</Text>
-                  <Text tabular dimColor>
-                    {[f.r > 0 ? `读 ${f.r}` : '', f.w > 0 ? `写 ${f.w}` : ''].filter(Boolean).join(' · ')}
-                  </Text>
+          {allFileEntries.length > 0 ? (
+            <Box flexDirection="column" gap={1}>
+              <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
+                <Text dimColor size="footnote">
+                  文件活动
+                </Text>
+                <Box flexDirection="row" columnGap={1}>
+                  {fileFilters.map(([fk, label]) => (
+                    <Button
+                      key={`dfile-filter-${fk}`}
+                      label={label}
+                      plain
+                      dimColor={fileFilter !== fk}
+                      onPress={() => setView(v => ({ ...v, fileFilter: fk, showAllFiles: false }))}
+                    />
+                  ))}
                 </Box>
-              ))}
+              </Box>
+              {shownFiles.length === 0 ? (
+                <Text dimColor size="footnote">
+                  没有符合条件的文件。
+                </Text>
+              ) : (
+                <Box flexDirection="column">
+                  {shownFiles.map(([p, f]) => (
+                    <Box key={`dfile-${p}`} flexDirection="row" justifyContent="space-between" columnGap={2}>
+                      <Text wrap="truncate-start">{shortFilePath(p)}</Text>
+                      <Text tabular dimColor>
+                        {[f.r > 0 ? `读 ${f.r}` : '', f.w > 0 ? `写 ${f.w}` : ''].filter(Boolean).join(' · ')}
+                      </Text>
+                    </Box>
+                  ))}
+                </Box>
+              )}
+              {filteredFiles.length > FILES_VISIBLE ? (
+                <Button
+                  key="dfile-more"
+                  label={
+                    view.showAllFiles
+                      ? filteredFiles.length > FILES_MAX
+                        ? `收起（已显示前 ${FILES_MAX} 个，共 ${filteredFiles.length} 个）`
+                        : '收起'
+                      : filteredFiles.length > FILES_MAX
+                        ? `显示前 ${FILES_MAX} 个（共 ${filteredFiles.length} 个）`
+                        : `显示全部 ${filteredFiles.length} 个`
+                  }
+                  plain
+                  dimColor
+                  onPress={() => setView(v => ({ ...v, showAllFiles: !v.showAllFiles }))}
+                />
+              ) : null}
             </Box>
           ) : null}
           {Object.keys(d.programs).length > 0 ? (

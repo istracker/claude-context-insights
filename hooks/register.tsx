@@ -5,17 +5,39 @@ import type {
   AccountMap,
   Activity,
   CategoryRow,
+  FileFilter,
+  InsightView,
   RateSnapshot,
   RateWindow,
+  ScanState,
   Snapshot,
   StepRecord,
   StepTotals,
 } from '../types'
 import { ACCENT, BLUE, GREY, ORANGE, PALETTE, contextTrendSvg, stackSvg, svgSize } from './charts'
 import { groupTools, renderInsights, renderSessionDetail, startInsights } from './insights'
-import { runScan } from './scan'
+import { cancelSessionDetail, runScan } from './scan'
 import type { PaneInput } from './insights'
-import { bump, cardStyle, dropMisfiledLimits, fmtTokens, sessionAccount, fmtUntil, fmtUsd, paneWidths, pct, programOf, sparkline, textBar, topEntries, windowLabel } from './util'
+import {
+  bump,
+  cardStyle,
+  detectContextDrops,
+  dropMisfiledLimits,
+  filterFiles,
+  fmtClockTime,
+  fmtTokens,
+  fmtUntil,
+  fmtUsd,
+  paneWidths,
+  pct,
+  programOf,
+  sessionAccount,
+  shortFilePath,
+  sparkline,
+  textBar,
+  topEntries,
+  windowLabel,
+} from './util'
 
 const PLUGIN = 'cc-context-insights'
 const PANE = 'cc-context-insights'
@@ -38,7 +60,16 @@ async function renderMain($: EngineInterface, e: PaneInput): Promise<JSX.Element
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" columnGap={2} paddingX={1} paddingTop={1} alignItems="center">
-        <Button key="back" label="← 返回洞察" plain dimColor onPress={() => void update($, focusAtom, () => null)} />
+        <Button
+          key="back"
+          label="← 返回洞察"
+          plain
+          dimColor
+          onPress={() => {
+            cancelSessionDetail()
+            void update($, focusAtom, () => null)
+          }}
+        />
         {isCurrent ? (
           <Text dimColor size="footnote">
             当前会话 · 实时
@@ -82,6 +113,10 @@ const accountsAtom = atom({ plugin: 'cc-context-insights', key: 'accounts' } as 
 const limitsAtom = atom({ plugin: 'cc-context-insights', key: 'limits' } as const, {} as Record<string, RateSnapshot>, {
   shape: 'limits-1',
 })
+const IDLE_SCAN: ScanState = { isRunning: false, doneFiles: 0, totalFiles: 0, doneBytes: 0, totalBytes: 0 }
+const scanAtom = atom({ plugin: 'cc-context-insights', key: 'scan' } as const, IDLE_SCAN, { shape: 'scan-1' })
+const DEFAULT_VIEW: InsightView = { range: '7d', sort: 'recent' }
+const viewAtom = atom({ plugin: 'cc-context-insights', key: 'view' } as const, DEFAULT_VIEW, { shape: 'view-2' })
 /** 额度快照跨会话保存（$.state 只活在本会话），切换账号后另一个账号的最后读数仍可显示 */
 export const LIMITS_STORE_KEY = 'limits-1'
 
@@ -319,6 +354,10 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
     const myLimits = mine && early ? (early.at > mine.at ? early : mine) : (mine ?? early)
     const cols = e.props.bodyColumns
     const { full } = paneWidths(cols)
+    const scan = await read($, scanAtom)
+    const view = await read($, viewAtom)
+    const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
+    const setView = (fn: (v: InsightView) => InsightView) => void update($, viewAtom, fn)
 
     // ----- 数据 -----
     const sum = await read($, stepTotals)
@@ -339,9 +378,20 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
       snap?.autoCompactAt !== undefined && tokens !== undefined ? Math.max(0, snap.autoCompactAt - tokens) : undefined
 
     const totalCalls = Object.values(act.tools).reduce((s, n) => s + n, 0)
-    const topFiles = Object.entries(act.files)
-      .sort((a, b) => b[1].r + b[1].w - (a[1].r + a[1].w))
-      .slice(0, 5)
+    const drops = detectContextDrops(list)
+    const fileFilter: FileFilter = view.fileFilter ?? 'all'
+    const allFileEntries = Object.entries(act.files)
+    const readFileCount = allFileEntries.filter(([, f]) => f.r > 0).length
+    const writeFileCount = allFileEntries.filter(([, f]) => f.w > 0).length
+    const filteredFiles = filterFiles(act.files, fileFilter)
+    const FILES_VISIBLE = 6
+    const FILES_MAX = 30
+    const shownFiles = view.showAllFiles ? filteredFiles.slice(0, FILES_MAX) : filteredFiles.slice(0, FILES_VISIBLE)
+    const fileFilters: [FileFilter, string][] = [
+      ['all', `全部 ${allFileEntries.length}`],
+      ['read', `读 ${readFileCount}`],
+      ['write', `写 ${writeFileCount}`],
+    ]
     const trend = list.slice(-60).map(s => s.ctx)
 
     // ----- 小组件 -----
@@ -495,6 +545,34 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
           )}
         </Section>
 
+        {/* 上下文事件（骤降明细） */}
+        {drops.length > 0 ? (
+          <Section
+            title="上下文事件"
+            note={`压缩或清空 · 共 ${drops.length} 次${drops.length > 10 ? '（显示最近 10 次）' : ''}`}
+          >
+            <Box flexDirection="column" gap={1}>
+              {drops
+                .slice(-10)
+                .reverse()
+                .map(ev => (
+                  <Box key={`sdrop-${ev.step}-${ev.at}`} flexDirection="row" justifyContent="space-between" columnGap={2}>
+                    <Text dimColor size="footnote" tabular>
+                      第 {ev.step} 次请求 · {fmtClockTime(ev.at, tzMin)}
+                    </Text>
+                    <Text tabular size="footnote">
+                      <Text dimColor>{fmtTokens(ev.from)} → </Text>
+                      <Text color={ORANGE} weight="medium">
+                        {fmtTokens(ev.to)}
+                      </Text>
+                      <Text dimColor>（-{pct(ev.from - ev.to, ev.from)}）</Text>
+                    </Text>
+                  </Box>
+                ))}
+            </Box>
+          </Section>
+        ) : null}
+
         {/* 本会话 */}
         <Section title="本会话">
           <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={1}>
@@ -514,15 +592,56 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
                 .map(([k, v]) => `${k} ${v}`)
                 .join(' · ')}
             </Text>
-            {topFiles.length > 0 ? (
-              <Box flexDirection="column">
-                {topFiles.map(([p, f]) =>
-                  row(
-                    `file-${p}`,
-                    <Text wrap="truncate-start">{p.split('/').slice(-2).join('/')}</Text>,
-                    [f.r > 0 ? `读 ${f.r}` : '', f.w > 0 ? `写 ${f.w}` : ''].filter(Boolean).join(' · '),
-                  ),
+            {allFileEntries.length > 0 ? (
+              <Box flexDirection="column" gap={1}>
+                <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
+                  <Text dimColor size="footnote">
+                    文件活动
+                  </Text>
+                  <Box flexDirection="row" columnGap={1}>
+                    {fileFilters.map(([fk, label]) => (
+                      <Button
+                        key={`sfile-filter-${fk}`}
+                        label={label}
+                        plain
+                        dimColor={fileFilter !== fk}
+                        onPress={() => setView(v => ({ ...v, fileFilter: fk, showAllFiles: false }))}
+                      />
+                    ))}
+                  </Box>
+                </Box>
+                {shownFiles.length === 0 ? (
+                  <Text dimColor size="footnote">
+                    没有符合条件的文件。
+                  </Text>
+                ) : (
+                  <Box flexDirection="column">
+                    {shownFiles.map(([p, f]) =>
+                      row(
+                        `file-${p}`,
+                        <Text wrap="truncate-start">{shortFilePath(p)}</Text>,
+                        [f.r > 0 ? `读 ${f.r}` : '', f.w > 0 ? `写 ${f.w}` : ''].filter(Boolean).join(' · '),
+                      ),
+                    )}
+                  </Box>
                 )}
+                {filteredFiles.length > FILES_VISIBLE ? (
+                  <Button
+                    key="sfile-more"
+                    label={
+                      view.showAllFiles
+                        ? filteredFiles.length > FILES_MAX
+                          ? `收起（已显示前 ${FILES_MAX} 个，共 ${filteredFiles.length} 个）`
+                          : '收起'
+                        : filteredFiles.length > FILES_MAX
+                          ? `显示前 ${FILES_MAX} 个（共 ${filteredFiles.length} 个）`
+                          : `显示全部 ${filteredFiles.length} 个`
+                    }
+                    plain
+                    dimColor
+                    onPress={() => setView(v => ({ ...v, showAllFiles: !v.showAllFiles }))}
+                  />
+                ) : null}
               </Box>
             ) : null}
             {Object.keys(act.programs).length > 0 ? (

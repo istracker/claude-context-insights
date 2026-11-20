@@ -110,6 +110,18 @@ export type DetailRequest = {
   out: number
 }
 
+/** 上下文骤降事件（压缩或清空） */
+export type ContextDrop = {
+  /** 第几次请求（从 1 开始） */
+  step: number
+  at: number
+  from: number
+  to: number
+}
+
+/** 文件活动筛选 */
+export type FileFilter = 'all' | 'read' | 'write'
+
 /** 双击会话后看到的上下文详情（非当前会话，从日志还原） */
 export type SessionDetail = {
   id: string
@@ -125,6 +137,8 @@ export type SessionDetail = {
   maxCtx: number
   /** 上下文骤降（被压缩或清空）的次数 */
   compactions: number
+  /** 上下文骤降事件明细（时间与前后 token） */
+  drops: ContextDrop[]
   tools: Record<string, number>
   programs: Record<string, number>
   files: Record<string, { r: number; w: number }>
@@ -178,6 +192,10 @@ export type InsightView = {
   pick?: { kind: RankKind; key: string }
   /** 哪些排行已展开显示全部 */
   openRanks?: RankKind[]
+  /** 会话详情页的文件活动筛选 */
+  fileFilter?: FileFilter
+  /** 会话详情页是否展开全部文件 */
+  showAllFiles?: boolean
 }
 
 /** 「更多」里可点选筛选的排行 */

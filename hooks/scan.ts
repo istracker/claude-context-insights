@@ -11,7 +11,7 @@ import type {
   SessionAgg,
   SessionDetail,
 } from '../types'
-import { bump, programOf } from './util'
+import { bump, detectContextDrops, programOf } from './util'
 
 // 状态引用与 scan.ts / insights.tsx 共用（同一 plugin+key 指向同一份状态）
 const sessionsAtom = atom({ plugin: 'cc-context-insights', key: 'sessions' } as const, [] as SessionAgg[], {
@@ -327,13 +327,18 @@ export async function loadAccounts($: EngineInterface, home: string, currentSess
 // ---------- 单个会话的上下文详情（双击会话时按需读取） ----------
 
 const detailAtom = atom({ plugin: 'cc-context-insights', key: 'detail' } as const, null as SessionDetail | null, {
-  shape: 'detail-1',
+  shape: 'detail-2',
 })
 const DETAIL_POINTS = 400
-const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+const FILE_TOOLS = new Set(['Read', 'NotebookRead', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const WRITE_FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
-/** 每次开始加载加一；加载途中发现它变了就放弃（用户又双击了别的会话） */
+/** 每次开始加载加一；加载途中发现它变了就放弃（用户又双击了别的会话或返回总览） */
 let detailToken = 0
+
+/** 返回总览时取消正在进行的后台详情读取 */
+export function cancelSessionDetail(): void {
+  detailToken += 1
+}
 
 /** 把逐请求序列均匀抽样到至多 n 个点，保留首尾 */
 export function downsample<T>(list: T[], n: number): T[] {
@@ -363,6 +368,7 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
     lastCtx: 0,
     maxCtx: 0,
     compactions: 0,
+    drops: [],
     tools: {},
     programs: {},
     files: {},
@@ -443,12 +449,7 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
       await update($, detailAtom, d => (d && d.id === id ? { ...d, doneBytes: offset } : d))
     }
     requests.sort((a, b) => a.at - b.at)
-    let compactions = 0
-    for (let i = 1; i < requests.length; i++) {
-      const prev = requests[i - 1]?.ctx ?? 0
-      const cur = requests[i]?.ctx ?? 0
-      if (prev > 50_000 && cur < prev * 0.6) compactions += 1
-    }
+    const drops = detectContextDrops(requests)
     const done: SessionDetail = {
       ...base,
       status: 'ready',
@@ -458,7 +459,8 @@ export async function loadSessionDetail($: EngineInterface, id: string, file: st
       model: Object.entries(models).sort((a, b) => b[1] - a[1])[0]?.[0],
       lastCtx: requests[requests.length - 1]?.ctx ?? 0,
       maxCtx: requests.reduce((m, r) => Math.max(m, r.ctx), 0),
-      compactions,
+      compactions: drops.length,
+      drops,
       tools,
       programs,
       files,

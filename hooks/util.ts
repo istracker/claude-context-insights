@@ -1,5 +1,5 @@
 // 两个面板共用的格式化与小工具
-import type { AccountMap, RateSnapshot, RateWindow } from '../types'
+import type { AccountMap, ContextDrop, FileFilter, RateSnapshot, RateWindow } from '../types'
 
 /** 命令前缀：跳过它们，取后面真正执行的程序 */
 const COMMAND_PREFIXES = new Set(['sudo', 'env', 'command', 'exec', 'time', 'nohup'])
@@ -168,6 +168,45 @@ export function fmtDayAgo(day: string, today: string): string {
   if (Number.isNaN(d) || d <= 0) return '今天'
   if (d === 1) return '昨天'
   return `${d} 天前`
+}
+
+/** 时间戳 → 本地时钟 HH:MM（tzMin 为东时区分钟数） */
+export function fmtClockTime(ts: number, tzMin: number): string {
+  const d = new Date(ts + tzMin * 60_000)
+  if (Number.isNaN(d.getTime())) return '—'
+  const hh = String(d.getUTCHours()).padStart(2, '0')
+  const mm = String(d.getUTCMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
+/** 识别上下文骤降事件（前一步 >50k 且骤降至 60% 以下，视为压缩或清空） */
+export function detectContextDrops(requests: { at: number; ctx: number }[]): ContextDrop[] {
+  const drops: ContextDrop[] = []
+  for (let i = 1; i < requests.length; i++) {
+    const prev = requests[i - 1]
+    const cur = requests[i]
+    if (!prev || !cur) continue
+    if (prev.ctx > 50_000 && cur.ctx < prev.ctx * 0.6) {
+      drops.push({ step: i + 1, at: cur.at, from: prev.ctx, to: cur.ctx })
+    }
+  }
+  return drops
+}
+
+/** 按全部 / 读 / 写筛选文件活动并按操作次数降序排 */
+export function filterFiles(
+  files: Record<string, { r: number; w: number }>,
+  filter: FileFilter,
+): [string, { r: number; w: number }][] {
+  const entries = Object.entries(files)
+  if (filter === 'read') return entries.filter(([, f]) => f.r > 0).sort((a, b) => b[1].r - a[1].r || b[1].w - a[1].w)
+  if (filter === 'write') return entries.filter(([, f]) => f.w > 0).sort((a, b) => b[1].w - a[1].w || b[1].r - a[1].r)
+  return entries.sort((a, b) => b[1].r + b[1].w - (a[1].r + a[1].w) || b[1].w - a[1].w)
+}
+
+/** 截短文件路径显示最后两段，兼容 Unix 与 Windows 分隔符 */
+export function shortFilePath(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).slice(-2).join('/') || p
 }
 
 export function escapeXml(s: string): string {

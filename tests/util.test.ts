@@ -4,7 +4,10 @@ import { contextTrendSvg, dailySvg, svgSize } from '../hooks/charts'
 import { mergeSessions, paginate, projectChips, rankIndex, toolKey } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
 import {
+  detectContextDrops,
   dropMisfiledLimits,
+  filterFiles,
+  fmtClockTime,
   fmtDayAgo,
   fmtTokens,
   fmtUntil,
@@ -12,6 +15,7 @@ import {
   programOf,
   sameAccountWindows,
   sessionAccount,
+  shortFilePath,
 } from '../hooks/util'
 import type { SessionAgg } from '../types'
 
@@ -191,4 +195,30 @@ test('项目分组胶囊与分页：按会话数排序、保留已选中冷门�
   expect(paginate(items, 99, 6)).toEqual({ page: 1, totalPages: 2, slice: [7, 8] })
   expect(paginate(items, -3, 6)).toEqual({ page: 0, totalPages: 2, slice: [1, 2, 3, 4, 5, 6] })
   expect(paginate([], 2, 6)).toEqual({ page: 0, totalPages: 1, slice: [] })
+})
+
+test('上下文骤降事件、文件活动筛选与路径截短', () => {
+  const t0 = Date.parse('2026-11-20T06:30:00Z')
+  const drops = detectContextDrops([
+    { at: t0, ctx: 40_000 },
+    { at: t0 + 60_000, ctx: 10_000 }, // 前一步 <=50k 不计
+    { at: t0 + 120_000, ctx: 160_000 },
+    { at: t0 + 180_000, ctx: 40_000 }, // 160k -> 40k（<60%）计为第 4 步骤降
+    { at: t0 + 240_000, ctx: 120_000 },
+    { at: t0 + 300_000, ctx: 100_000 }, // 下降不足 40% 不计
+  ])
+  expect(drops).toEqual([{ step: 4, at: t0 + 180_000, from: 160_000, to: 40_000 }])
+  // UTC 06:33 + 480min（北京）= 14:33
+  expect(fmtClockTime(t0 + 180_000, 480)).toBe('14:33')
+
+  const files = {
+    '/a/b/read-only.ts': { r: 4, w: 0 },
+    '/a/b/write-heavy.ts': { r: 1, w: 5 },
+    '/a/b/write-only.ts': { r: 0, w: 2 },
+  }
+  expect(filterFiles(files, 'all').map(([p]) => p)).toEqual(['/a/b/write-heavy.ts', '/a/b/read-only.ts', '/a/b/write-only.ts'])
+  expect(filterFiles(files, 'read').map(([p]) => p)).toEqual(['/a/b/read-only.ts', '/a/b/write-heavy.ts'])
+  expect(filterFiles(files, 'write').map(([p]) => p)).toEqual(['/a/b/write-heavy.ts', '/a/b/write-only.ts'])
+  expect(shortFilePath('/Users/me/proj/src/index.ts')).toBe('src/index.ts')
+  expect(shortFilePath('C:\\Users\\me\\proj\\src\\index.ts')).toBe('src/index.ts')
 })
