@@ -27,12 +27,14 @@ import {
   contextTrendSvg,
   dailyAverage,
   dailySvg,
+  donutSvg,
+  heatmapSvg,
   hoursSvg,
   lineSvg,
   stackSvg,
   svgSize,
 } from './charts'
-import type { DayPoint } from './charts'
+import type { DayPoint, HeatDay } from './charts'
 import {
   bump,
   cardStyle,
@@ -451,6 +453,38 @@ export function paginate<T>(items: T[], rawPage: number | undefined, pageSize: n
   return { page, totalPages, slice: items.slice(page * pageSize, (page + 1) * pageSize) }
 }
 
+/** 汇总所有按天活跃度（用于日历热力图）并计算近 30 天活跃天数与当前连续活跃天数 */
+export function buildHeatMap(
+  sessions: MergedSession[],
+  today: string,
+): { byDay: Record<string, HeatDay>; active30: number; streak: number } {
+  const byDay: Record<string, HeatDay> = {}
+  for (const s of sessions) {
+    for (const [k, d] of Object.entries(s.days)) {
+      const tok = tokensOf(d)
+      if (tok <= 0 && d.req <= 0) continue
+      const cur = byDay[k] ?? { usd: 0, tokens: 0, sessions: 0 }
+      cur.usd += s.dayUsd[k] ?? 0
+      cur.tokens += tok
+      cur.sessions += 1
+      byDay[k] = cur
+    }
+  }
+  const todayMs = Date.parse(today + 'T00:00:00Z')
+  if (Number.isNaN(todayMs)) return { byDay, active30: 0, streak: 0 }
+  const keyAt = (ago: number) => new Date(todayMs - ago * DAY_MS).toISOString().slice(0, 10)
+  let active30 = 0
+  for (let i = 0; i < 30; i++) if ((byDay[keyAt(i)]?.tokens ?? 0) > 0) active30 += 1
+  // 连续活跃：今天有活动就从今天往前数，今天还没活动就从昨天往前数
+  let streak = 0
+  const startAgo = (byDay[keyAt(0)]?.tokens ?? 0) > 0 ? 0 : 1
+  for (let i = startAgo; i < 365; i++) {
+    if ((byDay[keyAt(i)]?.tokens ?? 0) > 0) streak += 1
+    else break
+  }
+  return { byDay, active30, streak }
+}
+
 /** 账号显示名：邮箱，没见过就用 id 前 4 位 */
 export function accountLabel(acc: AccountMap, id: string | undefined): string {
   if (id === undefined) return '未归属'
@@ -643,6 +677,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const PAGE_SIZE = 6
     const { page, totalPages, slice: shownSessions } = paginate(sorted, view.page, PAGE_SIZE)
     const projChips = projectChips(active, activeProject)
+    // 宽屏下把「钱花在哪」与「每日成本」并排，压缩纵向滚动长度
+    const isWideCharts = e.props.bodyColumns >= 84
+    const chartColWidth = isWideCharts ? half : full
+    const donutRow = chartColWidth >= 320
+    const showPartTokens = !isWideCharts || chartColWidth >= 420
+    const showAccounts = view.account === undefined && byAccount.size > 1
+    const heat = buildHeatMap(scoped, today)
 
     // ----- 小组件 -----
     /** 区块卡片：标题 · 旁注 ··· 右上角关键数字 · 操作 */
@@ -905,6 +946,119 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     ]
     const kpiRows: JSX.Element[][] = []
     for (let i = 0; i < kpiItems.length; i += kpiCols) kpiRows.push(kpiItems.slice(i, i + kpiCols))
+
+    const costBreakdownCard = (
+      <Section title="钱花在哪" stat={total.usd > 0 ? `合计 ${fmtUsd(total.usd)}` : undefined}>
+        <Box flexDirection={Svg && total.usd > 0 && donutRow ? 'row' : 'column'} alignItems={Svg && total.usd > 0 && donutRow ? 'center' : 'stretch'} columnGap={3} rowGap={2}>
+          {Svg && total.usd > 0 ? (
+            <Chart
+              source={donutSvg(
+                parts.map(p => ({ name: p.name, value: total.usdBy[p.key], color: p.color, note: `${fmtUsd(total.usdBy[p.key])} · ${fmtTokens(total[p.key])} token` })),
+                96,
+                { top: fmtUsd(total.usd), sub: '合计' },
+              )}
+              alt="成本构成"
+              isInteractive
+            />
+          ) : null}
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+            {parts.map(p =>
+              legendRow(
+                `part-${p.key}`,
+                p.color,
+                p.name,
+                fmtUsd(total.usdBy[p.key]),
+                pct(total.usdBy[p.key], total.usd),
+                total.usdBy[p.key] === 0,
+                showPartTokens ? `${fmtTokens(total[p.key])} token` : undefined,
+              ),
+            )}
+          </Box>
+        </Box>
+        {topPart && total.usd > 0 ? (
+          <Text dimColor size="footnote">
+            {topPart.name}占 {pct(total.usdBy[topPart.key], total.usd)}：{PART_HINT[topPart.key]}。
+          </Text>
+        ) : null}
+      </Section>
+    )
+
+    const dailyCostCard = (
+      <Section
+        title="每日成本"
+        note={Svg ? '悬停柱子看明细' : undefined}
+        stat={`今天 ${fmtUsd(series[series.length - 1]?.usd ?? 0)} · 日均 ${fmtUsd(dailyAverage(series))}`}
+      >
+        {Svg ? (
+          <Chart source={dailySvg(series, chartColWidth)} alt={`最近 ${seriesDays} 天每日预估成本`} isInteractive />
+        ) : (
+          <Text color={ACCENT}>
+            {sparkline(
+              series.map(s => s.usd),
+              Math.max(...series.map(s => s.usd)),
+            )}
+          </Text>
+        )}
+      </Section>
+    )
+
+    const accountsCard = showAccounts ? (
+      <Section title="账号" stat={`合计 ${fmtUsd(accountTotal)}`}>
+        <Box flexDirection={Svg && donutRow ? 'row' : 'column'} alignItems={Svg && donutRow ? 'center' : 'stretch'} columnGap={3} rowGap={2}>
+          {Svg ? (
+            <Chart
+              source={donutSvg(
+                [...byAccount.entries()]
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([k, v], i) => ({
+                    name: k === 'none' ? '未归属' : accountLabel(accounts, k),
+                    value: v,
+                    color: ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE,
+                    note: fmtUsd(v),
+                  })),
+                96,
+                { top: fmtUsd(accountTotal), sub: `${byAccount.size} 账号` },
+              )}
+              alt="各账号成本占比"
+              isInteractive
+            />
+          ) : null}
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+            {[...byAccount.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([k, v], i) =>
+                legendRow(
+                  `acct-${k}`,
+                  ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE,
+                  k === 'none' ? '未归属' : accountLabel(accounts, k),
+                  fmtUsd(v),
+                  pct(v, accountTotal),
+                ),
+              )}
+          </Box>
+        </Box>
+      </Section>
+    ) : null
+
+    const heatmapCard = (
+      <Section
+        title="活跃度"
+        note={Svg ? '悬停看当天明细' : undefined}
+        stat={
+          heat.active30 > 0
+            ? `近 30 天活跃 ${heat.active30} 天${heat.streak >= 2 ? ` · 连续 ${heat.streak} 天` : ''}`
+            : '近 30 天无活动'
+        }
+      >
+        {Svg ? (
+          <Chart source={heatmapSvg(heat.byDay, today, isWideCharts && showAccounts ? half : full)} alt="活跃度热力图" isInteractive />
+        ) : (
+          <Text dimColor>
+            近 30 天活跃 {heat.active30} 天{heat.streak >= 2 ? ` · 连续 ${heat.streak} 天` : ''}
+          </Text>
+        )}
+      </Section>
+    )
 
     // ----- 版面 -----
     return (
@@ -1202,88 +1356,39 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           ) : null}
         </Section>
 
-        {/* 钱花在哪 */}
-        <Section title="钱花在哪" stat={total.usd > 0 ? `合计 ${fmtUsd(total.usd)}` : undefined}>
-          {Svg && total.usd > 0 ? (
-            <Chart
-              source={stackSvg(parts.map(p => ({ name: p.name, value: total.usdBy[p.key], color: p.color, note: fmtUsd(total.usdBy[p.key]) })), full)}
-              alt="成本构成"
-              isInteractive
-            />
-          ) : null}
-          <Box flexDirection="column">
-            {parts.map(p =>
-              legendRow(
-                `part-${p.key}`,
-                p.color,
-                p.name,
-                fmtUsd(total.usdBy[p.key]),
-                pct(total.usdBy[p.key], total.usd),
-                total.usdBy[p.key] === 0,
-                `${fmtTokens(total[p.key])} token`,
-              ),
-            )}
-          </Box>
-          {topPart && total.usd > 0 ? (
-            <Text dimColor size="footnote">
-              {topPart.name}占 {pct(total.usdBy[topPart.key], total.usd)}：{PART_HINT[topPart.key]}。
-            </Text>
-          ) : null}
-        </Section>
-
-        {/* 每日 */}
-        <Section
-          title="每日成本"
-          note={Svg ? '悬停柱子看明细' : undefined}
-          stat={`今天 ${fmtUsd(series[series.length - 1]?.usd ?? 0)} · 日均 ${fmtUsd(dailyAverage(series))}`}
-        >
-          {Svg ? (
-            <Chart source={dailySvg(series, full)} alt={`最近 ${seriesDays} 天每日预估成本`} isInteractive />
-          ) : (
-            <Text color={ACCENT}>
-              {sparkline(
-                series.map(s => s.usd),
-                Math.max(...series.map(s => s.usd)),
-              )}
-            </Text>
-          )}
-        </Section>
-
-        {/* 账号 */}
-        {view.account === undefined && byAccount.size > 1 ? (
-          <Section title="账号" stat={`合计 ${fmtUsd(accountTotal)}`}>
-            {Svg ? (
-              <Chart
-                source={stackSvg(
-                  [...byAccount.entries()]
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([k, v], i) => ({
-                      name: k === 'none' ? '未归属' : accountLabel(accounts, k),
-                      value: v,
-                      color: ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE,
-                      note: fmtUsd(v),
-                    })),
-                  full,
-                )}
-                alt="各账号成本占比"
-                isInteractive
-              />
-            ) : null}
-            <Box flexDirection="column">
-              {[...byAccount.entries()]
-                .sort((a, b) => b[1] - a[1])
-                .map(([k, v], i) =>
-                  legendRow(
-                    `acct-${k}`,
-                    ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE,
-                    k === 'none' ? '未归属' : accountLabel(accounts, k),
-                    fmtUsd(v),
-                    pct(v, accountTotal),
-                  ),
-                )}
+        {/* 钱花在哪 + 每日成本：宽屏双列并排，窄屏自动单列 */}
+        {isWideCharts ? (
+          <Box flexDirection="row" columnGap={3}>
+            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+              {costBreakdownCard}
             </Box>
-          </Section>
-        ) : null}
+            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+              {dailyCostCard}
+            </Box>
+          </Box>
+        ) : (
+          <Box flexDirection="column" gap={4}>
+            {costBreakdownCard}
+            {dailyCostCard}
+          </Box>
+        )}
+
+        {/* 账号 + 活跃度热力图：多账号且宽屏时双列并排 */}
+        {isWideCharts && showAccounts ? (
+          <Box flexDirection="row" columnGap={3}>
+            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+              {accountsCard}
+            </Box>
+            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+              {heatmapCard}
+            </Box>
+          </Box>
+        ) : (
+          <Box flexDirection="column" gap={4}>
+            {accountsCard}
+            {heatmapCard}
+          </Box>
+        )}
 
         <Text dimColor size="caption">
           等价 API 成本＝这些用量按 API 标价折算的价值；订阅用户不按它计费，真正的上限看订阅额度。

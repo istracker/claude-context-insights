@@ -183,6 +183,21 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
     await ui.unmount()
   }
 
+  // 宽面板：钱花在哪与每日成本双列并排，环形图与活跃度热力图都画得出来
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const wide = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 120 } })
+    expect((await wide.find({ type: 'Text', text: /^钱花在哪$/ }))?.text).toBe('钱花在哪')
+    expect((await wide.find({ type: 'Text', text: /^每日成本$/ }))?.text).toBe('每日成本')
+    expect((await wide.find({ type: 'Text', text: /近 30 天活跃 1 天/ }))?.text).toContain('活跃 1 天')
+    if (surface === 'desktop') {
+      const svgs = await wide.findAll({ type: 'Svg' })
+      expect(svgs.some(s => s.props.alt === '成本构成')).toBe(true)
+      expect(svgs.some(s => s.props.alt === '活跃度热力图')).toBe(true)
+      expect(svgs.every(s => typeof s.props.width === 'number' && typeof s.props.height === 'number')).toBe(true)
+    }
+    await wide.unmount()
+  }
+
   // 双击会话：单击不进入；双击进入它的上下文（非当前会话，从日志还原）；返回回到总览
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'open-s2' })

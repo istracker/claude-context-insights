@@ -73,6 +73,7 @@ export function dailyAverage(series: DayPoint[]): number {
 export function dailySvg(series: DayPoint[], width = 520): string {
   const W = clampW(width, 240)
   const H = 180
+  if (series.length === 0) return svg(W, H, '')
   const left = 44
   const right = 16
   const top = 22
@@ -145,6 +146,8 @@ export function hoursSvg(hours: Record<string, number>, width = 300): string {
 /** color 填 'track' 时用轨道底色（跟随深浅色） */
 export type Segment = { name: string; value: number; color: string; note?: string }
 
+let clipSeq = 0
+
 /** 一条圆角堆叠条，段间留 2px 缝 */
 export function stackSvg(segs: Segment[], width = 400): string {
   const W = clampW(width, 120)
@@ -152,19 +155,139 @@ export function stackSvg(segs: Segment[], width = 400): string {
   const total = segs.reduce((s, x) => s + x.value, 0)
   if (total <= 0) return svg(W, H, `<rect width="${W}" height="${H}" rx="5" class="track"/>`)
   const shown = segs.filter(s => s.value / total > 0.002)
+  if (shown.length === 0) return svg(W, H, `<rect width="${W}" height="${H}" rx="5" class="track"/>`)
+  const shownTotal = shown.reduce((s, x) => s + x.value, 0)
   const gap = 2
   const usable = W - gap * (shown.length - 1)
   let x = 0
   const body = shown
     .map(s => {
-      const w = Math.max(2, (s.value / total) * usable)
+      const w = Math.max(2, (s.value / shownTotal) * usable)
       const paint = s.color === 'track' ? 'class="track"' : `fill="${s.color}"`
-      const r = `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${H}" ${paint}><title>${escapeXml(s.name)} ${s.note ?? ''}</title></rect>`
+      const r = `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${H}" ${paint}><title>${escapeXml(s.name)} ${escapeXml(s.note ?? '')}</title></rect>`
       x += w + gap
       return r
     })
     .join('')
-  return svg(W, H, `<clipPath id="c"><rect width="${W}" height="${H}" rx="5"/></clipPath><g clip-path="url(#c)">${body}</g>`)
+  const cid = `c${++clipSeq}`
+  return svg(W, H, `<clipPath id="${cid}"><rect width="${W}" height="${H}" rx="5"/></clipPath><g clip-path="url(#${cid})">${body}</g>`)
+}
+
+/** 环形图：中心显示主数值与小标，段间留细缝，悬停看明细 */
+export function donutSvg(
+  segs: Segment[],
+  size = 108,
+  center?: { top: string; sub?: string },
+): string {
+  const S = clampW(size, 72)
+  const cx = S / 2
+  const cy = S / 2
+  const strokeW = Math.max(10, Math.round(S * 0.16))
+  const r = (S - strokeW) / 2 - 2
+  const C = 2 * Math.PI * r
+  const total = segs.reduce((s, x) => s + Math.max(0, x.value), 0)
+  const track = `<circle cx="${cx}" cy="${cy}" r="${r.toFixed(2)}" fill="none" stroke="var(--track)" stroke-width="${strokeW}"/>`
+  let arcs = ''
+  if (total > 0) {
+    const shown = segs.filter(s => s.value > 0 && s.value / total > 0.002)
+    const shownTotal = shown.reduce((s, x) => s + x.value, 0)
+    const gap = shown.length > 1 ? 2.5 : 0
+    let acc = 0
+    arcs = shown
+      .map(s => {
+        const raw = (s.value / shownTotal) * C
+        const len = shown.length > 1 ? Math.max(2, raw - gap) : C
+        const rest = Math.max(0, C - len)
+        const el = `<circle cx="${cx}" cy="${cy}" r="${r.toFixed(2)}" fill="none" stroke="${s.color}" stroke-width="${strokeW}" stroke-dasharray="${len.toFixed(2)} ${rest.toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"><title>${escapeXml(s.name)}${s.note ? ' · ' + escapeXml(s.note) : ''}</title></circle>`
+        acc += raw
+        return el
+      })
+      .join('')
+  }
+  const label = center
+    ? `<text x="${cx}" y="${(center.sub ? cy + 2 : cy + 5).toFixed(1)}" text-anchor="middle" class="ink strong" style="font-size:13px">${escapeXml(center.top)}</text>` +
+      (center.sub
+        ? `<text x="${cx}" y="${(cy + 15).toFixed(1)}" text-anchor="middle" style="font-size:10px">${escapeXml(center.sub)}</text>`
+        : '')
+    : ''
+  return svg(S, S, track + arcs + label)
+}
+
+export type HeatDay = { usd: number; tokens: number; sessions: number }
+
+/** 活跃度日历热力图：按周排布（周一到周日），按 token 平方根映射深浅，悬停看当天明细 */
+export function heatmapSvg(byDay: Record<string, HeatDay>, today: string, width = 340): string {
+  const W = clampW(width, 200)
+  const left = 20
+  const top = 18
+  const cell = 11
+  const gap = 3
+  const step = cell + gap
+  const H = top + 7 * step - gap + 4
+  const weeks = Math.max(8, Math.min(26, Math.floor((W - left) / step)))
+  const todayMs = Date.parse(today + 'T00:00:00Z')
+  if (Number.isNaN(todayMs)) return svg(W, H, '')
+  // 周一=0 .. 周日=6
+  const todayDow = (new Date(todayMs).getUTCDay() + 6) % 7
+  const startMs = todayMs - ((weeks - 1) * 7 + todayDow) * 86_400_000
+
+  type Cell = { col: number; row: number; day: string; info?: HeatDay }
+  const cells: Cell[] = []
+  let maxTok = 0
+  for (let col = 0; col < weeks; col++) {
+    for (let row = 0; row < 7; row++) {
+      const ms = startMs + (col * 7 + row) * 86_400_000
+      if (ms > todayMs) continue
+      const day = new Date(ms).toISOString().slice(0, 10)
+      const info = byDay[day]
+      if (info && info.tokens > maxTok) maxTok = info.tokens
+      cells.push({ col, row, day, info })
+    }
+  }
+
+  // 周内标签（一 / 三 / 五）
+  const rowLabels = [
+    [0, '一'],
+    [2, '三'],
+    [4, '五'],
+  ]
+    .map(([r, text]) => `<text x="0" y="${top + (r as number) * step + 9}" style="font-size:10px">${text}</text>`)
+    .join('')
+
+  // 顶部月份标签：每当新月份首次出现在某周，且距上一个标签至少 28px 时标出
+  let lastMonth = -1
+  let lastLabelX = -100
+  const monthLabels: string[] = []
+  for (let col = 0; col < weeks; col++) {
+    const ms = startMs + col * 7 * 86_400_000
+    const m = new Date(ms).getUTCMonth() + 1
+    const x = left + col * step
+    if (m !== lastMonth && x - lastLabelX >= 28) {
+      monthLabels.push(`<text x="${x}" y="11" style="font-size:10px">${m}月</text>`)
+      lastLabelX = x
+    }
+    lastMonth = m
+  }
+
+  const rects = cells
+    .map(c => {
+      const x = left + c.col * step
+      const y = top + c.row * step
+      const tok = c.info?.tokens ?? 0
+      const tip = c.info
+        ? `${c.day}\n${fmtUsd(c.info.usd)} · ${c.info.sessions} 个会话 · ${fmtTokens(c.info.tokens)} token`
+        : `${c.day}\n无活动`
+      if (tok <= 0 || maxTok <= 0) {
+        return `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" class="track"><title>${escapeXml(tip)}</title></rect>`
+      }
+      const ratio = Math.sqrt(tok / maxTok)
+      const op = ratio <= 0.25 ? 0.3 : ratio <= 0.5 ? 0.52 : ratio <= 0.75 ? 0.76 : 1
+      return `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" fill="${ACCENT}" opacity="${op}"><title>${escapeXml(tip)}</title></rect>`
+    })
+    .join('')
+
+  const actualW = left + weeks * step - gap + 2
+  return svg(actualW, H, rowLabels + monthLabels.join('') + rects)
 }
 
 /** 排行行下的细进度线：轨道底色 + 实色部分（单行大量渲染，用精简样式） */
