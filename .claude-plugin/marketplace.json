@@ -8,7 +8,7 @@
     {
       "name": "cc-context-insights",
       "source": "./",
-      "description": "在 Claude Code 旁打开一个面板：订阅额度、token 用量与会话（非官方）",
+      "description": "多个 Claude 账号的订阅额度并排看，按项目追踪 token 用量的历史。数据只在本机读取与计算（非官方）",
       "displayName": "上下文洞察"
     }
   ]
