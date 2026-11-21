@@ -28,6 +28,8 @@ export const COMMAND = 'ctx'
  * 只是请求，用户拖过的宽度优先；额度是否并排由宿主按实际排版决定，与这个值无关
  */
 export const PANE_COLUMNS = 75
+/** 终端内联面板请求的正文行数：不传时宿主只给终端高度的三分之一。只是请求，宿主按布局余量封顶，用户拖过的高度优先 */
+export const PANE_ROWS = 60
 export const MAX_STEPS = 300
 /** 额度快照跨会话保存（$.state 只活在本会话），切换账号后另一个账号的最后读数仍可显示 */
 export const LIMITS_STORE_KEY = 'limits-1'

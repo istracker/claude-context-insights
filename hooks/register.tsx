@@ -42,6 +42,7 @@ import {
   setViewState,
   TITLE,
   PANE_COLUMNS,
+  PANE_ROWS,
 } from './state'
 
 import {
@@ -206,7 +207,7 @@ export const register: Register = on => {
     await setFocus($, () => currentId)
     // 请求的默认宽度：恰好能把两个账号的额度并排放下（PANE_COLUMNS）。
     // 只是请求：用户拖过的宽度优先，宿主最多给窗口的 45%
-    const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true, columns: PANE_COLUMNS }).catch(() => undefined)
+    const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true, columns: PANE_COLUMNS, rows: PANE_ROWS }).catch(() => undefined)
     void runScan($)
     void refresh($, isFull ? 'full' : 'summary')
     return {
@@ -222,7 +223,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    void $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS })
+    void $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS, rows: PANE_ROWS })
     void refresh($, 'summary')
     await startInsights($).catch(err => $.ui.log(`${PLUGIN}: 洞察启动失败 ${String(err)}`))
     return started
