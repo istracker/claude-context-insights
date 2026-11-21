@@ -1,6 +1,6 @@
 # claude-context-insights
 
-> 非官方插件，专为 Claude Code / Claude Desktop 设计，与 Anthropic 无关联。插件名 `cc-context-insights`，命令 `/ctx-insights`。
+> 非官方插件，专为 Claude Code / Claude Desktop 设计，与 Anthropic 无关联。插件名 `cc-context-insights`，命令 `/ctx`。
 
 「上下文洞察」面板：打开是所有会话的总览。功能设计参考 [dsh-context](https://github.com/bowenliang123/dsh-context)（Apache-2.0），配色取自 Claude 自己的上下文用量界面。
 
@@ -19,7 +19,7 @@
 - **会话（以项目为主线）**：每个项目一行（会话数 · 最近活动 · token 消耗 · 占比，不画进度条），默认展开第一个，点项目名展开 / 收起（一次只展开一个）；项目每页 6 个、展开项目里的会话每页 4 个；搜索框（标题 / 项目 / 最后消息）与点选筛选时展开第一个有结果的项目；按时间、token 或当前上下文排序（同时决定项目顺序）；每个会话一张两行卡片（标题 · 时间 / 账号 · token · 最后一条消息），点标题在 Claude Desktop 里打开（当前登录账号的会话），其余复制恢复命令（带 `cd` 项目目录）；当前会话标「当前」
 - **工具上下文**：全宽紧凑表，列出累计 token、调用次数与平均每次（按入参与返回内容估算），可点表头切换排序、可展开 MCP；平均每次超过 10k 标黄并给出建议；默认显示 4 项；点一项筛选上方会话
 
-## 当前会话的上下文（`/ctx-insights full` 进入，「← 返回洞察」回到总览）
+## 当前会话的上下文（`/ctx full` 进入，「← 返回洞察」回到总览）
 
 - 运行时的实时数据，与自带的 `/context` 同口径——已使用百分比、按类别分段的占用条和三列明细（名称 · token · 占比）、订阅额度、逐请求的上下文趋势（橙色虚线为自动压缩阈值）、上下文骤降事件流、本会话统计、活动（支持按全部 / 读 / 写筛选与展开文件）、子 Agent。默认本地估算，点「精确统计」调用 token 计数接口
 
@@ -47,8 +47,9 @@ claude plugin install cc-context-insights --marketplace /path/to/claude-context-
 
 面板在会话开始时自动打开，显示总览。关掉后用唯一的命令重新打开：
 
-- `/ctx-insights`：打开总览，顺带增量扫描日志
-- `/ctx-insights full`：直接进入当前会话的上下文，并做一次精确统计
+- `/ctx`：打开总览，顺带增量扫描日志
+- `/ctx full`：直接进入当前会话的上下文，并做一次精确统计
+- `/ctx close`：关闭面板（也可以点面板右上角的 ✕，或按 Esc）
 
 桌面端、VS Code 和移动端用 SVG 画图，终端用文字条和迷你趋势字符。
 

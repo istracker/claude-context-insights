@@ -41,7 +41,9 @@ import {
   setTurns,
   setViewState,
   TITLE,
+  PANE_COLUMNS,
 } from './state'
+
 import {
   bump,
   cardStyle,
@@ -177,16 +179,23 @@ async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<
 
 export const register: Register = on => {
   /**
-   * /ctx-insights 是面板唯一的入口（命令在 startInsights 里注册）：
+   * /ctx 是面板唯一的入口（命令在 startInsights 里注册）：
    * 打开「上下文洞察」总览，并增量扫描日志；
-   * `/ctx-insights full`：直接进入当前会话的上下文并做一次精确统计。
+   * `/ctx full`：直接进入当前会话的上下文并做一次精确统计。
    */
   // 匹配器用字面量，校验器才能静态看出它对应哪个命令
-  on('command.run', { command: 'ctx-insights' }, async ($, e) => {
+  on('command.run', { command: 'ctx' }, async ($, e) => {
+    // /ctx close：关闭面板（Desktop 标签上的 × 关不掉插件面板时用）
+    if (e.args.trim() === 'close') {
+      await $.ui.close({ id: PANE }).catch(() => undefined)
+      return { text: '已关闭上下文洞察。', isTextDisplayOnly: true }
+    }
     const isFull = e.args.trim() === 'full'
     const currentId = isFull ? await $.session.id().catch(() => null) : null
     await setFocus($, () => currentId)
-    const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true }).catch(() => undefined)
+    // 请求的默认宽度：恰好能把两个账号的额度并排放下（PANE_COLUMNS）。
+    // 只是请求：用户拖过的宽度优先，宿主最多给窗口的 45%
+    const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true, columns: PANE_COLUMNS }).catch(() => undefined)
     void runScan($)
     void refresh($, isFull ? 'full' : 'summary')
     return {
@@ -202,7 +211,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    void $.ui.open({ id: PANE, title: TITLE })
+    void $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS })
     void refresh($, 'summary')
     await startInsights($).catch(err => $.ui.log(`${PLUGIN}: 洞察启动失败 ${String(err)}`))
     return started
@@ -280,7 +289,7 @@ export const register: Register = on => {
     return ran
   })
 
-  // 「上下文洞察」面板：默认总览；`/ctx-insights full` 进入当前会话的上下文（匹配器用字面量供校验器静态识别）
+  // 「上下文洞察」面板：默认总览；`/ctx full` 进入当前会话的上下文（匹配器用字面量供校验器静态识别）
   on('ui.render', { component: 'Pane', requestId: 'cc-context-insights' }, async ($, e) => renderMain($, e))
 }
 

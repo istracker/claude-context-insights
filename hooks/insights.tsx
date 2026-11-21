@@ -18,6 +18,8 @@ import type {
 import { dayKey, runScan } from './scan'
 import {
   COMMAND,
+  PANE,
+  TITLE,
   getAccounts,
   getLimits,
   getScan,
@@ -35,14 +37,12 @@ import {
   ACCENT,
   AMBER,
   BLUE,
-  GREY,
   ORANGE,
   PALETTE,
   TEAL,
   dailyTokenSvg,
-  donutSvg,
-  dualBarSvg,
-  quotaSvg,
+  fluidBarSvg,
+  fluidHeight,
   svgSize,
   thinStackSvg,
 } from './charts'
@@ -57,7 +57,6 @@ import {
   quotaWindowName,
   fmtUsd,
   layoutTier,
-  paneWidths,
   pct,
   prettyModel,
   sameAccountWindows,
@@ -152,9 +151,6 @@ async function openInDesktop(
   await $.ui.copy({ text: url, surface })
   $.ui.toast('打开失败，已复制链接，可粘贴到浏览器地址栏', { timeoutMs: 6000 })
 }
-
-/** 不换行空格：占位用，让空文本行也保有一行高度 */
-const NBSP = '\u00A0'
 
 /** 给 shell 用的单引号转义 */
 export function shellQuote(v: string): string {
@@ -303,20 +299,66 @@ export function mergeSessions(aggs: SessionAgg[]): MergedSession[] {
 }
 
 /** 上一个等长时间段，用于环比；「全部」没有 */
-export function prevRangeDays(range: InsightRange, now: number, tzMin: number): Set<string> | undefined {
-  if (range === 'all') return undefined
-  const n = range === 'today' ? 1 : range === '7d' ? 7 : 30
-  const out = new Set<string>()
-  for (let i = n; i < 2 * n; i++) out.add(dayKey(now - i * DAY_MS, tzMin))
-  return out
+/** 按天偏移（0 = 今天）表示的闭区间 [近, 远]；全部时间为 undefined */
+type DaySpan = [number, number]
+
+/** 本地日历上的年、月（0 起）、日 */
+function localDate(now: number, tzMin: number): { y: number; m: number; d: number } {
+  const t = new Date(now + tzMin * 60_000)
+  return { y: t.getUTCFullYear(), m: t.getUTCMonth(), d: t.getUTCDate() }
+}
+const daysInMonth = (y: number, m: number) => new Date(Date.UTC(y, m + 1, 0)).getUTCDate()
+
+/** 范围对应的天偏移区间 */
+export function rangeSpan(range: InsightRange, now: number, tzMin: number): DaySpan | undefined {
+  const { y, m, d } = localDate(now, tzMin)
+  switch (range) {
+    case 'today':
+      return [0, 0]
+    case 'yesterday':
+      return [1, 1]
+    case '7d':
+      return [0, 6]
+    case '30d':
+      return [0, 29]
+    case 'month':
+      return [0, d - 1]
+    case 'lastMonth':
+      return [d, d + daysInMonth(y, m - 1) - 1]
+    default:
+      return undefined
+  }
 }
 
-export function rangeDays(range: InsightRange, now: number, tzMin: number): Set<string> | undefined {
-  if (range === 'all') return undefined
-  const n = range === 'today' ? 1 : range === '7d' ? 7 : 30
+/** 环比用的上一段：本月对上月同期（1 号到同一天），上月对再上个月，其余向前平移同样天数 */
+function prevSpan(range: InsightRange, now: number, tzMin: number): DaySpan | undefined {
+  const span = rangeSpan(range, now, tzMin)
+  if (!span) return undefined
+  const { y, m, d } = localDate(now, tzMin)
+  if (range === 'month') {
+    const last = daysInMonth(y, m - 1)
+    const n = Math.min(d, last)
+    return [d + last - n, d + last - 1]
+  }
+  if (range === 'lastMonth') {
+    const last = daysInMonth(y, m - 1)
+    return [d + last, d + last + daysInMonth(y, m - 2) - 1]
+  }
+  const len = span[1] - span[0] + 1
+  return [span[0] + len, span[1] + len]
+}
+
+function spanDays(span: DaySpan | undefined, now: number, tzMin: number): Set<string> | undefined {
+  if (!span) return undefined
   const out = new Set<string>()
-  for (let i = 0; i < n; i++) out.add(dayKey(now - i * DAY_MS, tzMin))
+  for (let i = span[0]; i <= span[1]; i++) out.add(dayKey(now - i * DAY_MS, tzMin))
   return out
+}
+export function prevRangeDays(range: InsightRange, now: number, tzMin: number): Set<string> | undefined {
+  return spanDays(prevSpan(range, now, tzMin), now, tzMin)
+}
+export function rangeDays(range: InsightRange, now: number, tzMin: number): Set<string> | undefined {
+  return spanDays(rangeSpan(range, now, tzMin), now, tzMin)
 }
 
 /** 一段时间内的汇总 */
@@ -504,14 +546,27 @@ export function accountLabel(acc: AccountMap, id: string | undefined): string {
 
 // ---------- 文案 ----------
 
-const RANGES: [InsightRange, string][] = [
-  ['today', '今天'],
-  ['7d', '近 7 天'],
-  ['30d', '近 30 天'],
-]
 /** 卡片右上角的时间范围说明 */
-const RANGE_TITLE: Record<InsightRange, string> = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部' }
-const PREV_TITLE: Record<InsightRange, string> = { today: '昨天', '7d': '前 7 天', '30d': '前 30 天', all: '' }
+const RANGE_TITLE: Record<InsightRange, string> = {
+  today: '今天',
+  yesterday: '昨天',
+  '7d': '近 7 天',
+  '30d': '近 30 天',
+  month: '本月',
+  lastMonth: '上月',
+  all: '全部时间',
+}
+/** 下拉里的顺序 */
+const RANGE_MENU: InsightRange[] = ['today', 'yesterday', '7d', '30d', 'month', 'lastMonth', 'all']
+const PREV_TITLE: Record<InsightRange, string> = {
+  today: '昨天',
+  yesterday: '前天',
+  '7d': '前 7 天',
+  '30d': '前 30 天',
+  month: '上月同期',
+  lastMonth: '前一个月',
+  all: '',
+}
 const SORTS: [InsightSort, string][] = [
   ['recent', '按时间'],
   ['tokens', '按 token'],
@@ -528,7 +583,7 @@ const SETTINGS_PROJECTS = 12
 export async function startInsights($: EngineInterface): Promise<void> {
   await $.command.register({
     name: COMMAND,
-    description: '打开上下文洞察：本会话的上下文窗口，以及所有会话的额度、成本与活动（加 full 精确统计）',
+    description: '打开上下文洞察：额度、用量与会话（full 精确统计本会话，close 关闭面板）',
   })
   // 各账号上次的额度读数存在 $.store（跨会话），载入到本会话状态
   const stored = (await $.store.get(LIMITS_STORE_KEY)) as Record<string, RateSnapshot> | undefined
@@ -539,7 +594,7 @@ export async function startInsights($: EngineInterface): Promise<void> {
   void runScan($)
 }
 
-// /ctx-insights 的处理在 register.tsx（要调用本会话的精确统计）
+// /ctx 的处理在 register.tsx（要调用本会话的精确统计）
 
 /** 「洞察」标签页的内容：所有会话的额度、成本、会话与活动 */
 /**
@@ -560,13 +615,15 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const Chart = (p: { source: string; alt: string; isInteractive?: boolean; viewHeight?: number }) => {
       if (!Svg) return null
       // 注意：JSX 编译成全局 h(...)，局部变量不能叫 h
+      // 铺满图：不给宽度（宿主按标记里的 100% 铺满卡片），高度照原样
+      const fluidH = fluidHeight(p.source)
       const size = svgSize(p.source)
       return (
         <Svg
           source={p.source}
           alt={p.alt}
-          width={size.width}
-          height={p.viewHeight ?? Math.ceil(size.height * 1.04) + 2}
+          width={fluidH === undefined ? size.width : undefined}
+          height={fluidH ?? p.viewHeight ?? Math.ceil(size.height * 1.04) + 2}
           // 只有需要悬停提示的图才放进沙盒内嵌框；其余画成普通图片。
           // 内嵌框会抢滚轮事件、各自重排，列表里一多（会话圆环、额度条）滚动就会严重抖动
           isInteractive={p.isInteractive === true ? true : undefined}
@@ -612,7 +669,6 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     if (insightsMemo?.sig === sig) return insightsMemo.tree
     const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
     const setView = (fn: (v: InsightView) => InsightView) => void setViewState($, fn)
-    const { full } = paneWidths(e.props.bodyColumns)
 
     // ----- 数据 -----
     // 标题优先用 Desktop 侧边栏里的标题，找会话时和侧边栏对得上；搜索也按它匹配
@@ -642,6 +698,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       if (s.costUsd === undefined) unpriced += 1
     }
     const prompted = total.in + total.cr + total.cw
+    /** 会话列表不受时间范围影响：列出全部有活动的会话，token 是会话累计总量 */
+    const listed: (MergedSession & { r: Totals })[] = []
+    for (const s of scoped) {
+      const r = addSession(emptyTotals(), s, undefined)
+      if (r.req === 0 && r.prompts === 0) continue
+      listed.push({ ...s, r })
+    }
 
     const prevDays = prevRangeDays(view.range, now, tzMin)
     let prevTokens: number | undefined
@@ -687,9 +750,13 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     // 「未归属」的会话不属于任何账号，没有额度可显示
     const shownLimits = view.account === undefined ? limitRows : limitRows.filter(r => r.account === view.account)
 
-    const seriesDays = view.range === '30d' || view.range === 'all' ? 30 : 7
+    // 每日柱图的天数：覆盖所选范围；单日范围画到那天为止的 7 天，全部时间画最近 30 天
+    const span = rangeSpan(view.range, now, tzMin) ?? [0, 29]
+    const seriesFrom = span[0]
+    const seriesTo = Math.max(span[1], span[0] + 6)
+    const seriesDays = seriesTo - seriesFrom + 1
     const series: DayPoint[] = []
-    for (let i = seriesDays - 1; i >= 0; i--) {
+    for (let i = seriesTo; i >= seriesFrom; i--) {
       const k = dayKey(now - i * DAY_MS, tzMin)
       const p: DayPoint = { day: k, usd: 0, tokens: 0, req: 0, prompts: 0 }
       for (const s of scoped) {
@@ -704,15 +771,17 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     }
 
     // 决策排行：模型（按成本）、工具（按上下文估算 token）
+    // 点模型筛选会话：按全部时间算用过它的会话（会话列表本身不分时段）
     const ranks = rankIndex(active, days, view.expandMcp ?? false)
+    const allRanks = rankIndex(listed, undefined, false)
     // 旧状态里可能残留已移除的排行（如 prog、proj、skill），只认当前存在的排行
     const activePick =
       view.pick && view.pick.kind in ranks ? view.pick : undefined
     const pickLabel = activePick ? (activePick.kind === 'model' ? prettyModel(activePick.key) : activePick.key) : ''
-    const pickedIds = activePick ? (ranks[activePick.kind]?.get(activePick.key)?.ids ?? new Set<string>()) : undefined
+    const pickedIds = activePick ? (allRanks[activePick.kind]?.get(activePick.key)?.ids ?? new Set<string>()) : undefined
     // 只剩「按时间」「按 token」：旧状态里的 cost 按 token 排，context 退回按时间
     const sortMode: InsightSort = view.sort === 'cost' ? 'tokens' : view.sort === 'context' ? 'recent' : view.sort
-    const sorted = [...active]
+    const sorted = [...listed]
       .filter(
         s =>
           (pickedIds === undefined || pickedIds.has(s.id)) &&
@@ -731,13 +800,14 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     // 分页器固定在模块底部。每页项目数按模块高度算，让项目列表刚好填满
     const tier = layoutTier(e.props.bodyColumns)
     const isNarrow = tier === 'narrow'
-    const SESSIONS_PER_PAGE = 5
+    /** 展开的项目每页 6 个会话（一屏放得下，不用滚动）；模块高度按「满 6 个 + 分页器」固定 */
+    const SESSIONS_PER_PAGE = 6
     // 高度估算（单位：字符行，minHeight 的单位）。桌面端的文字行、间距、内边距都比一个字符行小，
     // 按实测折算；终端按字符行整数算
     const U =
       e.surface === 'terminal'
         ? { line: 1, gap: 1, pad: 1, cardExtra: 2, listRow: 2, pager: 1 }
-        : { line: 0.9, gap: 0.5, pad: 0.5, cardExtra: 1, listRow: 1.5, pager: 0.9 }
+        : { line: 0.9, gap: 0.5, pad: 0.5, cardExtra: 0.75, listRow: 1.5, pager: 0.9 }
     /** 一个会话卡片：两行文字加边框与内边距 */
     const rowH = 2 * U.line + U.cardExtra
     /** 展开一个有 n 个会话的项目所需的行数：项目头 + 间距 + 内边距 + 卡片们 +（多页时）底部分页器 */
@@ -745,7 +815,8 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       const k = Math.min(SESSIONS_PER_PAGE, Math.max(1, n))
       return U.line + U.gap + U.pad + k * rowH + (k - 1) * U.gap + (n > SESSIONS_PER_PAGE ? U.gap + U.pager : 0)
     }
-    const expandedMax = Math.max(0, ...groups.map(g => openRows(g.sessions.length)))
+    // 不看实际会话数：始终按一整页（6 个会话 + 分页器）的高度留位，换项目、翻页、筛选时高度都不变
+    const expandedMax = openRows(SESSIONS_PER_PAGE + 1)
     const PROJECTS_PER_PAGE = Math.max(5, Math.min(14, Math.floor((expandedMax - U.gap - U.pager) / U.listRow)))
     const projectPages = Math.max(1, Math.ceil(groups.length / PROJECTS_PER_PAGE))
     const projectPage = Math.min(Math.max(0, view.page ?? 0), projectPages - 1)
@@ -810,7 +881,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       </Box>
     )
     /** 一个额度窗口：上行「窗口名 ··· 重置时刻 已用%」，下行进度条（与 Claude 自带用量界面同风格）；桌面端整行画成一张图，百分比对齐进度条右端 */
-    const quotaRow = (key: string, w: RateWindow, barWidth: number, isStale: boolean) => {
+    const quotaRow = (key: string, w: RateWindow, isStale: boolean) => {
       const resetAt = w.resetsAt ? Date.parse(w.resetsAt) : NaN
       const isReset = !Number.isNaN(resetAt) && resetAt <= now
       const p = Math.max(0, Math.min(100, w.percentUsed))
@@ -820,12 +891,21 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       const reset = Number.isNaN(resetAt) ? '' : isReset ? '已重置' : `${fmtResetAt(resetAt, now, tzMin)} 重置`
       const percent = isReset ? '—' : `已用 ${w.percentUsed}%`
       if (Svg) {
+        // 文字用文字元素（两端对齐），进度条横向铺满所在列：不再按估算的像素宽度画，列多宽条就多宽
         return (
-          <Box key={key}>
-          <Chart
-            source={quotaSvg(name, reset, percent, isReset ? 0 : p / 100, color, barWidth, undefined, isStale)}
-            alt={`${name} ${reset} ${percent}`}
-          />
+          <Box key={key} flexDirection="column" gap={1}>
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
+              <Text weight="medium" wrap="truncate-end">
+                {name}
+              </Text>
+              <Text tabular>
+                <Text dimColor>{reset}  </Text>
+                <Text weight="medium" dimColor={isReset}>
+                  {percent}
+                </Text>
+              </Text>
+            </Box>
+            <Chart source={fluidBarSvg(isReset ? 0 : p / 100, color, isStale)} alt={`${name} ${reset} ${percent}`} />
           </Box>
         )
       }
@@ -844,13 +924,6 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         </Box>
       )
     }
-    // 订阅额度：所有账号都完整显示，宽面板每行两个账号
-    const quotaCols = isNarrow || shownLimits.length < 2 ? 1 : 2
-    // 两个账号在同一张卡片里分两列（不是两张卡片），列宽≈(整宽-列间距)/2；宁可略估大，SVG 的 max-width:100% 会缩回列内
-    const quotaBarWidth = Math.max(80, quotaCols === 2 ? Math.floor((full - 24) / 2) : full)
-    const quotaRows: (typeof shownLimits)[] = []
-    for (let i = 0; i < shownLimits.length; i += quotaCols) quotaRows.push(shownLimits.slice(i, i + quotaCols))
-    const toolTotalTokens = [...ranks.tool.values()].reduce((a, it) => a + it.value, 0)
     const pctDone = scan.totalBytes > 0 ? Math.round((scan.doneBytes / scan.totalBytes) * 100) : 100
 
     const accountOptions = [
@@ -876,7 +949,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       return (
         <Box key={`share-${id}`} flexDirection="column" gap={1}>
           {Svg ? (
-            <Chart source={thinStackSvg(rows.map(r => ({ value: r.tokens, color: r.color })), full)} alt="token 构成" />
+            <Chart source={thinStackSvg(rows.map(r => ({ value: r.tokens, color: r.color })))} alt="token 构成" />
           ) : null}
           <Box flexDirection="column">
             {rows.map(r => {
@@ -958,166 +1031,6 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         onPress: () => setView(vw => ({ ...vw, account: k, page: 0 })),
       }))
 
-    /**
-     * 工具上下文：左边两个环形图（累计 token、调用次数），右边共用一张图例表。
-     * 前 5 个工具单独着色，其余合成一块；同一工具在两个环里同色。
-     * 图例中间的双条把两种占比并排，一眼看出「调用少却占得多」的工具。
-     */
-    const TOOL_TOP = 5
-    const TOOL_COLORS = [BLUE, ORANGE, TEAL, AMBER, '#8B5CF6']
-    const toolItems = [...ranks.tool.entries()].filter(([, it]) => it.value > 0).sort((a, b) => b[1].value - a[1].value)
-    const toolTotalCalls = toolItems.reduce((a, [, it]) => a + it.subCount, 0)
-    type ToolSlice = { key: string; name: string; tokens: number; calls: number; color: string; isRest: boolean }
-    const toolSlices: ToolSlice[] = toolItems.slice(0, TOOL_TOP).map(([k, it], i) => ({
-      key: k,
-      name: k,
-      tokens: it.value,
-      calls: it.subCount,
-      color: TOOL_COLORS[i] ?? GREY,
-      isRest: false,
-    }))
-    const toolRest = toolItems.slice(TOOL_TOP)
-    if (toolRest.length > 0) {
-      toolSlices.push({
-        key: '__rest',
-        name: `其余 ${toolRest.length} 个`,
-        tokens: toolRest.reduce((a, [, it]) => a + it.value, 0),
-        calls: toolRest.reduce((a, [, it]) => a + it.subCount, 0),
-        color: GREY,
-        isRest: true,
-      })
-    }
-    const DONUT = 104
-    const showToolBars = Boolean(Svg) && !isNarrow
-    // 环形图与图例并排时，图例约占整宽减去两个环；双条吃掉名称与数字列之外的空间
-    const legendWidth = isNarrow ? full : full - DONUT * 2 - 48
-    const dualBarWidth = Math.max(40, Math.min(360, legendWidth - 150 - 170))
-    const toolCard = (
-      <Section title="工具上下文" stat={toolItems.length > 0 ? `${toolItems.length} 个工具` : undefined}>
-        {toolItems.length === 0 ? (
-          <Text dimColor>暂无</Text>
-        ) : (
-          <Box flexDirection="column" gap={2}>
-            <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={4} rowGap={2}>
-              {Svg ? (
-                <Box flexDirection="row" columnGap={3} flexShrink={0}>
-                  <Chart
-                    source={donutSvg(
-                      toolSlices.map(t => ({ name: t.name, value: t.tokens, color: t.color })),
-                      DONUT,
-                      { top: fmtTokens(toolTotalTokens), sub: '累计 token' },
-                    )}
-                    alt={`工具累计 token ${fmtTokens(toolTotalTokens)}`}
-                  />
-                  <Chart
-                    source={donutSvg(
-                      toolSlices.map(t => ({ name: t.name, value: t.calls, color: t.color })),
-                      DONUT,
-                      { top: toolTotalCalls.toLocaleString(), sub: '次数' },
-                    )}
-                    alt={`工具调用 ${toolTotalCalls} 次`}
-                  />
-                </Box>
-              ) : null}
-              <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={30}>
-                <Box flexDirection="row" alignItems="center" columnGap={2}>
-                  <Box flexGrow={1}>
-                    <Text dimColor size="footnote">
-                      工具
-                    </Text>
-                  </Box>
-                  {showToolBars ? (
-                    <Box minWidth={Math.round(dualBarWidth / 7)}>
-                      <Text dimColor size="footnote">
-                        <Text color={GREY}>▬</Text> token 占比 <Text dimColor>▬</Text> 次数占比
-                      </Text>
-                    </Box>
-                  ) : null}
-                  <Box minWidth={12} justifyContent="flex-end">
-                    <Text dimColor size="footnote">
-                      累计 token
-                    </Text>
-                  </Box>
-                  <Box minWidth={11} justifyContent="flex-end">
-                    <Text dimColor size="footnote">
-                      次数
-                    </Text>
-                  </Box>
-                </Box>
-                {toolSlices.map(t => {
-                  const isPicked = activePick?.kind === 'tool' && activePick.key === t.key
-                  const mcp = /（MCP）$/.test(t.name)
-                  const label = (
-                    <Text wrap="truncate-end" color={isPicked ? ACCENT : undefined} weight={isPicked ? 'semibold' : 'regular'}>
-                      {isPicked ? '✓ ' : ''}
-                      {mcp ? t.name.replace('（MCP）', '') : t.name}
-                      {mcp ? (
-                        <Text dimColor size="footnote">
-                          {' '}
-                          MCP
-                        </Text>
-                      ) : null}
-                    </Text>
-                  )
-                  return (
-                    <Box key={`tool-${t.key}`} flexDirection="row" alignItems="center" columnGap={2}>
-                      <Text color={t.color}>■</Text>
-                      <Box flexGrow={1} flexShrink={1} minWidth={0}>
-                        {t.isRest ? (
-                          label
-                        ) : (
-                          <Button
-                            key={`pick-tool-${t.key}`}
-                            plain
-                            dimColor={activePick?.kind === 'tool' && !isPicked}
-                            onPress={() =>
-                              setView(v => ({
-                                ...v,
-                                pick: isPicked ? undefined : { kind: 'tool', key: t.key },
-                                page: 0,
-                                sessionPage: 0,
-                                                }))
-                            }
-                          >
-                            {label}
-                          </Button>
-                        )}
-                      </Box>
-                      {showToolBars ? (
-                        <Chart
-                          source={dualBarSvg(t.tokens / toolTotalTokens, toolTotalCalls > 0 ? t.calls / toolTotalCalls : 0, t.color, dualBarWidth)}
-                          alt={`${t.name} token 占 ${pct(t.tokens, toolTotalTokens)}，次数占 ${pct(t.calls, toolTotalCalls)}`}
-                        />
-                      ) : null}
-                      <Box minWidth={12} justifyContent="flex-end">
-                        <Text tabular>
-                          {fmtTokens(t.tokens)}{' '}
-                          <Text dimColor size="footnote">
-                            {pct(t.tokens, toolTotalTokens)}
-                          </Text>
-                        </Text>
-                      </Box>
-                      <Box minWidth={11} justifyContent="flex-end">
-                        <Text tabular>
-                          {t.calls.toLocaleString()}{' '}
-                          <Text dimColor size="footnote">
-                            {pct(t.calls, toolTotalCalls)}
-                          </Text>
-                        </Text>
-                      </Box>
-                    </Box>
-                  )
-                })}
-              </Box>
-            </Box>
-            <Text dimColor size="footnote">
-              点工具可筛选会话。工具 token 约按 4 字符 ≈ 1 token 估算。
-            </Text>
-          </Box>
-        )}
-      </Section>
-    )
-
     // 构成：类型 / 模型 / 账号三选一，一次只看一张表；都按 token 排
     const typeRows: ShareRow[] = [...PARTS]
       .sort((a, b) => total[b.key] - total[a.key])
@@ -1156,10 +1069,33 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       ['缓存命中', pct(total.cr, prompted)],
     ]
     const avgTokens = series.length > 0 ? series.reduce((a, x) => a + x.tokens, 0) / series.length : 0
+    /** 柱图下的首、中、尾三个日期 */
+    const axisLabel = (i: number) => (seriesFrom === 0 && i === series.length - 1 ? '今天' : (series[i]?.day ?? '').slice(5).replace('-', '/'))
+    const axisDays = series.length > 2 ? [axisLabel(0), axisLabel(Math.floor((series.length - 1) / 2)), axisLabel(series.length - 1)] : series.map((_, i) => axisLabel(i))
 
+    /** 时间范围下拉：只写名称；具体日期写在用量卡的副标题里 */
+    const rangeOptions = RANGE_MENU.map(r => ({ value: r, label: RANGE_TITLE[r] }))
+    const curSpan = rangeSpan(view.range, now, tzMin)
+    const md = (k: string) => k.slice(5).replace('-', '/')
+    const rangeDates = curSpan
+      ? curSpan[0] === curSpan[1]
+        ? md(dayKey(now - curSpan[0] * DAY_MS, tzMin))
+        : `${md(dayKey(now - curSpan[1] * DAY_MS, tzMin))} – ${md(dayKey(now - curSpan[0] * DAY_MS, tzMin))}`
+      : '全部记录'
     /** 用量：token 为主（本地记录，准确），金额为辅（按标价折算，估算） */
     const spendCard = (
-      <Section title="用量" stat={RANGE_TITLE[view.range]}>
+      <Section
+        title="用量"
+        right={
+          // 时间范围只影响这张卡：放在卡片右上角
+          <Select
+            key="range"
+            options={rangeOptions}
+            value={view.range}
+            onSelect={value => setView(v => ({ ...v, range: value as InsightRange }))}
+          />
+        }
+      >
         {/* 1. 主数字：token 总量与环比 */}
         <Box flexDirection="column" gap={2}>
           <Box flexDirection="row" flexWrap="wrap" alignItems="flex-end" columnGap={1}>
@@ -1167,12 +1103,11 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               {fmtTokens(tokenTotal)}
             </Text>
             <Text dimColor>token</Text>
-            {tokenChange ? (
-              <Text dimColor size="footnote">
-                {'  '}
-                {tokenChange}
-              </Text>
-            ) : null}
+            <Text dimColor size="footnote" tabular>
+              {'  '}
+              {rangeDates}
+              {tokenChange ? ` · ${tokenChange}` : ''}
+            </Text>
           </Box>
           {/* 2. 一排小指标：标签在上、数值在下 */}
           <Box flexDirection="row" columnGap={2}>
@@ -1197,7 +1132,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         {/* 3. 每天的 token：折线 + 日均虚线 */}
         <Box flexDirection="column">
           {Svg ? (
-            <Chart source={dailyTokenSvg(series, full, 120, showMoney)} alt={`最近 ${seriesDays} 天每日 token`} isInteractive />
+            <Chart source={dailyTokenSvg(series, 100, showMoney, seriesFrom === 0)} alt={`${RANGE_TITLE[view.range]}每日 token（${seriesDays} 天）`} isInteractive />
           ) : (
             <Text color={ACCENT}>
               {sparkline(
@@ -1206,9 +1141,19 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               )}
             </Text>
           )}
+          {/* 日期标注画在图外：图横向拉伸铺满，图里的文字会被拉变形 */}
+          {Svg && series.length > 0 ? (
+            <Box flexDirection="row" justifyContent="space-between">
+              {axisDays.map((d, i) => (
+                <Text key={`axis-${i}`} dimColor size="footnote" tabular>
+                  {d}
+                </Text>
+              ))}
+            </Box>
+          ) : null}
           <Text dimColor size="footnote" tabular>
             ┄ 日均 {fmtTokens(avgTokens)}
-            {'    '}— 今天 {fmtTokens(series[series.length - 1]?.tokens ?? 0)}
+            {seriesFrom === 0 ? `    今天 ${fmtTokens(series[series.length - 1]?.tokens ?? 0)}（进行中）` : ''}
           </Text>
         </Box>
 
@@ -1239,10 +1184,6 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         </Text>
       </Section>
     )
-
-    /** 工具栏右侧的日期范围：起 → 今天 */
-    const spanDays = view.range === 'today' ? 1 : view.range === '7d' ? 7 : view.range === '30d' ? 30 : 0
-    const rangeSpan = spanDays === 0 ? '全部' : spanDays === 1 ? dayKey(now, tzMin) : `${dayKey(now - (spanDays - 1) * DAY_MS, tzMin)} → ${dayKey(now, tzMin)}`
 
     // ----- 设置页 -----
     const settingsPage = tab === 'settings' ? await renderSettings() : null
@@ -1455,12 +1396,19 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     // ----- 版面 -----
     const tree = (
       <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
-        {/* 工具栏：左边设置与账号，右边日期范围与时间段 */}
+        {/* 工具栏：左边小标题，右边（右对齐）扫描进度、账号与设置 */}
         <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" rowGap={1} columnGap={2}>
+          {/* 小标题：Desktop 只开一个插件面板时不显示面板标题（外层标签固定叫「插件」），面板里自己写上名字 */}
+          <Text weight="semibold">{TITLE}</Text>
           <Box flexDirection="row" columnGap={1} alignItems="center">
+            {scan.isRunning ? (
+              <Text dimColor size="footnote" tabular>
+                扫描中 {pctDone}%
+              </Text>
+            ) : null}
             <Button
               key="open-settings"
-              label={tab === 'settings' ? '‹ 返回' : '插件设置'}
+              label={tab === 'settings' ? '‹ 返回' : '⚙\uFE0E 插件设置'}
               variant="secondary"
               onPress={() => setView(v => ({ ...v, tab: v.tab === 'settings' ? 'overview' : 'settings' }))}
             />
@@ -1472,31 +1420,18 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                 onSelect={value => setView(v => ({ ...v, account: value === 'all' ? undefined : value, page: 0 }))}
               />
             ) : null}
-            {scan.isRunning ? (
-              <Text dimColor size="footnote" tabular>
-                扫描中 {pctDone}%
-              </Text>
-            ) : null}
+            {/* 关闭：Desktop 标签上的 × 与 Cmd+\ 关不掉插件面板，由插件自己调 $.ui.close */}
+            {e.surface === 'terminal' ? null : (
+              <Button
+                key="close-pane"
+                label="✕"
+                plain
+                dimColor
+                role="dismiss"
+                onPress={() => void $.ui.close({ id: PANE }).catch(() => undefined)}
+              />
+            )}
           </Box>
-          {tab === 'settings' ? null : (
-            <Box flexDirection="row" columnGap={2} alignItems="center">
-              {isNarrow ? null : (
-                <Text dimColor size="footnote" tabular>
-                  {rangeSpan}
-                </Text>
-              )}
-              <Box flexDirection="row" columnGap={1}>
-                {RANGES.map(([r, label]) => (
-                  <Button
-                    key={`range-${r}`}
-                    label={label}
-                    variant={view.range === r ? 'primary' : 'secondary'}
-                    onPress={() => setView(v => ({ ...v, range: r, page: 0 }))}
-                  />
-                ))}
-              </Box>
-            </Box>
-          )}
         </Box>
 
         {scan.error ? <Text color="error">扫描出错：{scan.error}</Text> : null}
@@ -1516,44 +1451,38 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               }
               stat={shownLimits[0]?.isLive ? '实时' : undefined}
             >
-              {quotaRows.map((row, ri) => (
-                <Box key={`quota-row-${ri}`} flexDirection="row" columnGap={4}>
-                  {row.map(r => (
-                    <Box
-                      key={`quota-${r.account}`}
-                      flexDirection="column"
-                      gap={1}
-                      width={quotaCols === 2 ? '50%' : '100%'}
-                      flexGrow={1}
-                      flexShrink={1}
-                      minWidth={0}
-                    >
-                      {limitRows.length > 1 || !r.isLive ? (
-                        <Text dimColor size="footnote" wrap="truncate-end">
-                          {accountLabel(accounts, r.account === 'current' ? undefined : r.account).replace('未归属', '当前账号')}
-                          {r.isLive ? '' : ` · ${fmtAgo(now - r.at)}的读数`}
-                        </Text>
-                      ) : null}
-                      {r.windows.map(w => quotaRow(`q-${r.account}-${w.kind}`, w, quotaBarWidth, !r.isLive))}
-                    </Box>
-                  ))}
-                  {/* 奇数个账号时补一个空位，保持两列对齐 */}
-                  {row.length < quotaCols ? <Box key={`quota-pad-${ri}`} width="50%" flexGrow={1} flexShrink={1} minWidth={0} /> : null}
-                </Box>
-              ))}
+              {/* 账号并排、放不下自动换行：每个账号按自身内容的实际宽度占位，由宿主排版决定是否换行，
+                  插件里不估算任何宽度。两个放得下就一行两列，放不下第二个换到下一行并铺满 */}
+              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={3}>
+                {shownLimits.map(r => (
+                  <Box
+                    key={`quota-${r.account}`}
+                    flexDirection="column"
+                    gap={1}
+                    flexGrow={1}
+                    flexShrink={0}
+                  >
+                    {limitRows.length > 1 || !r.isLive ? (
+                      <Text dimColor size="footnote" wrap="truncate-end">
+                        {accountLabel(accounts, r.account === 'current' ? undefined : r.account).replace('未归属', '当前账号')}
+                        {r.isLive ? '' : ` · ${fmtAgo(now - r.at)}的读数`}
+                      </Text>
+                    ) : null}
+                    {r.windows.map(w => quotaRow(`q-${r.account}-${w.kind}`, w, !r.isLive))}
+                  </Box>
+                ))}
+              </Box>
             </Section>
 
             {/* 花费：总数、每天、花在哪 */}
             {spendCard}
 
-            {/* 上下文被谁占了 */}
-            {toolCard}
 
             {/* 会话：以项目为主线，项目一行（会话数 · 最近活动 · 成本与占比），展开后列出它的会话 */}
             <Section
               title="会话"
               note={
-                active.length === 0
+                listed.length === 0
                   ? undefined
                   : activePick
                     ? `${groups.length} 个项目 · ${sorted.length} 个会话用过${RANK_NOUN[activePick.kind]}「${pickLabel}」`
@@ -1582,7 +1511,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
               ) : null}
               {/* 工具行：左边搜索，右边排序（输入框宽度由宿主决定，和排序同排更自然） */}
               <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={3} rowGap={1}>
-                {active.length > 0 ? (
+                {listed.length > 0 ? (
                   <Input
                     key="session-search"
                     placeholder="搜索会话"
@@ -1615,10 +1544,10 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
                   onPress={() => setView(v => ({ ...v, pick: undefined }))}
                 />
               ) : null}
-              {active.length === 0 ? (
-                <Text dimColor>{scan.isRunning ? '正在扫描…' : '这段时间没有会话。'}</Text>
+              {listed.length === 0 ? (
+                <Text dimColor>{scan.isRunning ? '正在扫描…' : '还没有会话。'}</Text>
               ) : isFiltering && sorted.length === 0 ? (
-                <Text dimColor>这段时间没有符合筛选条件的会话。</Text>
+                <Text dimColor>没有符合筛选条件的会话。</Text>
               ) : null}
               <Box flexDirection="column" gap={1} minHeight={sessionBodyRows} justifyContent="space-between">
               <Box flexDirection="column" gap={1}>

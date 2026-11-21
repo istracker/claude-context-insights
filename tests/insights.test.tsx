@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 const PANE = {
   plugin: 'cc-context-insights',
   component: 'Pane',
-  // 洞察已并入「上下文」面板；/ctx-insights 会把它切到「洞察」标签页
+  // 洞察已并入「上下文」面板；/ctx 会把它切到「洞察」标签页
   requestId: 'cc-context-insights',
   props: {
     title: '上下文',
@@ -112,7 +112,7 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
     value: { kind: 'file', size: e.path.endsWith('s2.jsonl') ? SIZE2 : SIZE, mtimeMs: 0, isLink: false },
   }))
 
-  await $.command.run({ command: 'ctx-insights', args: '' })
+  await $.command.run({ command: 'ctx', args: '' })
   // 等后台扫描跑完
   for (let i = 0; i < 5000 && store.size === 0; i++) await new Promise<void>(r => r())
   for (let i = 0; i < 2000; i++) await new Promise<void>(r => r())
@@ -171,11 +171,15 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
     expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
     if (surface === 'desktop') {
       const svgs = await ui.findAll({ type: 'Svg' })
-      // 每张图都显式带宽高（否则内嵌框默认 150px，或宿主放大铺满后裁掉底部）
+      // 每张图都显式带高度（否则内嵌框默认 150px）；宽度：铺满图不给（按 100% 铺满卡片），其余给数字
       expect(svgs.every(s => typeof s.props.height === 'number' && (s.props.height as number) > 0)).toBe(true)
-      expect(svgs.every(s => typeof s.props.width === 'number' && (s.props.width as number) > 0)).toBe(true)
-      // 用量卡片里的每日 token 折线图 120 高，框高留了余量，不会被裁
-      expect(svgs.some(s => (s.props.height as number) >= 120 && (s.props.height as number) <= 135)).toBe(true)
+      expect(
+        svgs.every(s =>
+          String(s.props.source).includes('data-fluid="1"') ? s.props.width === undefined : typeof s.props.width === 'number',
+        ),
+      ).toBe(true)
+      // 用量卡片里的每日 token 柱图铺满宽度、100 高
+      expect(svgs.some(s => String(s.props.alt).includes('每日 token') && s.props.height === 100 && s.props.width === undefined)).toBe(true)
       // 额度条画成普通图片，只有每日柱状图（要悬停明细）放进内嵌框
       const quotaBars = svgs.filter(s => String(s.props.alt).includes('重置'))
       expect(quotaBars.length).toBeGreaterThan(0)
@@ -185,19 +189,9 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
       ])
     }
 
-    // ---- 工具页签：累计 token 与次数两个环形图 + 图例；点一项筛选会话并跳到会话页签 ----
-    expect((await ui.find({ type: 'Text', text: /^Bash$/ }))?.text).toBe('Bash')
-    expect(await ui.find({ type: 'Button', key: 'tool-sort-avg' })).toBeUndefined()
-    if (surface === 'desktop') {
-      const alts = (await ui.findAll({ type: 'Svg' })).map(s => String(s.props.alt))
-      expect(alts.some(a => a.startsWith('工具累计 token'))).toBe(true)
-      expect(alts.some(a => a.startsWith('工具调用'))).toBe(true)
-    }
-    await ui.press({ key: 'pick-tool-Bash' })
-    expect((await ui.find({ type: 'Text', text: /用过工具「Bash」/ }))?.text).toContain('1 个会话')
-    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
-    await ui.press({ key: 'clear-pick' })
-    expect(await ui.find({ type: 'Text', text: /用过工具/ })).toBeUndefined()
+    // 工具上下文卡已移除：工具怎么调用由模型决定，用户无从下手
+    expect(await ui.find({ type: 'Text', text: /^工具上下文$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', key: 'pick-tool-Bash' })).toBeUndefined()
 
     // ---- 会话页签：以项目为主线，默认展开第一个项目 ----
     expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
@@ -257,7 +251,7 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
       const svgs = await wide.findAll({ type: 'Svg' })
       // 卡片里只剩每日柱状图，不再有环形图
       expect(svgs.some(s => s.props.alt === '成本构成')).toBe(false)
-      expect(svgs.every(s => typeof s.props.width === 'number' && typeof s.props.height === 'number')).toBe(true)
+      expect(svgs.every(s => typeof s.props.height === 'number')).toBe(true)
     }
     await wide.unmount()
   }

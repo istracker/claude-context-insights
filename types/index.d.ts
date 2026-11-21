@@ -144,7 +144,8 @@ export type ScanState = {
   tzMin?: number
 }
 
-export type InsightRange = 'today' | '7d' | '30d' | 'all'
+/** 时间范围：分段控件给今天 / 近 7 天 / 近 30 天，下拉里再多昨天、本月、上月、全部 */
+export type InsightRange = 'today' | 'yesterday' | '7d' | '30d' | 'month' | 'lastMonth' | 'all'
 /** 顶部页签 */
 export type InsightTab = 'overview' | 'sessions' | 'tools' | 'settings'
 

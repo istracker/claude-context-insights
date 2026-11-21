@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { contextTrendSvg, dailySvg, svgSize } from '../hooks/charts'
-import { groupByProject, mergeSessions, rankIndex, shellQuote, toolKey } from '../hooks/insights'
+import { groupByProject, mergeSessions, prevRangeDays, rangeDays, rangeSpan, rankIndex, shellQuote, toolKey } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
 import {
   billingWeight,
@@ -292,4 +292,25 @@ test('shellQuote：普通路径原样，含空格或单引号的加引号转义'
   expect(shellQuote('/Users/me/proj')).toBe('/Users/me/proj')
   expect(shellQuote('/Users/me/my proj')).toBe("'/Users/me/my proj'")
   expect(shellQuote("/tmp/it's")).toBe("'/tmp/it'\\''s'")
+})
+
+test('时间范围：本月、上月按日历月算，环比本月对上月同期', () => {
+  // 2026-11-22 中午（UTC+8）
+  const now = Date.UTC(2026, 10, 22, 4)
+  const tz = 480
+  expect(rangeSpan('today', now, tz)).toEqual([0, 0])
+  expect(rangeSpan('yesterday', now, tz)).toEqual([1, 1])
+  expect(rangeSpan('month', now, tz)).toEqual([0, 21])
+  // 上月 = 10/1～10/31：距今 22～52 天
+  expect(rangeSpan('lastMonth', now, tz)).toEqual([22, 52])
+  expect(rangeSpan('all', now, tz)).toBeUndefined()
+  const month = [...(rangeDays('month', now, tz) ?? [])].sort()
+  expect(month[0]).toBe('2026-11-01')
+  expect(month[month.length - 1]).toBe('2026-11-22')
+  const prev = [...(prevRangeDays('month', now, tz) ?? [])].sort()
+  expect(prev[0]).toBe('2026-10-01')
+  expect(prev[prev.length - 1]).toBe('2026-10-22')
+  const prevLast = [...(prevRangeDays('lastMonth', now, tz) ?? [])].sort()
+  expect(prevLast[0]).toBe('2026-09-01')
+  expect(prevLast[prevLast.length - 1]).toBe('2026-09-30')
 })

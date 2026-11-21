@@ -21,7 +21,13 @@ import type {
 export const PLUGIN = 'cc-context-insights'
 export const PANE = 'cc-context-insights'
 export const TITLE = '上下文洞察'
-export const COMMAND = 'ctx-insights'
+export const COMMAND = 'ctx'
+/**
+ * /ctx 打开面板时请求的宽度（字符列）：刚好能把两个账号的额度并排放下。
+ * 实测（2026-11-22，Claude Desktop）：面板拉到 75 列时两个账号从两行变成一行。
+ * 只是请求，用户拖过的宽度优先；额度是否并排由宿主按实际排版决定，与这个值无关
+ */
+export const PANE_COLUMNS = 75
 export const MAX_STEPS = 300
 /** 额度快照跨会话保存（$.state 只活在本会话），切换账号后另一个账号的最后读数仍可显示 */
 export const LIMITS_STORE_KEY = 'limits-1'
@@ -76,7 +82,7 @@ const limitsAtom = atom({ plugin: 'cc-context-insights', key: 'limits' } as cons
 const liveLimitsAtom = atom({ plugin: 'cc-context-insights', key: 'live-limits' } as const, null as RateSnapshot | null, {
   shape: 'live-limits-1',
 })
-// 面板默认是洞察总览；`/ctx-insights full` 切到当前会话的上下文（focus = 会话 id）
+// 面板默认是洞察总览；`/ctx full` 切到当前会话的上下文（focus = 会话 id）
 const focusAtom = atom({ plugin: 'cc-context-insights', key: 'focus' } as const, null as string | null, {
   shape: 'focus-1',
 })

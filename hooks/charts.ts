@@ -183,78 +183,7 @@ export function stackSvg(segs: Segment[], width = 400): string {
   return svg(W, H, `<clipPath id="${cid}"><rect width="${W}" height="${H}" rx="5"/></clipPath><g clip-path="url(#${cid})">${body}</g>`)
 }
 
-/** 环形图：中心显示主数值与小标，段间留细缝，悬停看明细 */
-export function donutSvg(
-  segs: Segment[],
-  size = 108,
-  center?: { top: string; sub?: string },
-): string {
-  const S = clampW(size, 72)
-  const cx = S / 2
-  const cy = S / 2
-  const strokeW = Math.max(10, Math.round(S * 0.16))
-  const r = (S - strokeW) / 2 - 2
-  const C = 2 * Math.PI * r
-  const total = segs.reduce((s, x) => s + Math.max(0, x.value), 0)
-  const track = `<circle cx="${cx}" cy="${cy}" r="${r.toFixed(2)}" fill="none" stroke="var(--track)" stroke-width="${strokeW}"/>`
-  let arcs = ''
-  if (total > 0) {
-    const shown = segs.filter(s => s.value > 0 && s.value / total > 0.002)
-    const shownTotal = shown.reduce((s, x) => s + x.value, 0)
-    const gap = shown.length > 1 ? 2.5 : 0
-    let acc = 0
-    arcs = shown
-      .map(s => {
-        const raw = (s.value / shownTotal) * C
-        const len = shown.length > 1 ? Math.max(2, raw - gap) : C
-        const rest = Math.max(0, C - len)
-        const el = `<circle cx="${cx}" cy="${cy}" r="${r.toFixed(2)}" fill="none" stroke="${s.color}" stroke-width="${strokeW}" stroke-dasharray="${len.toFixed(2)} ${rest.toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"><title>${escapeXml(s.name)}${s.note ? ' · ' + escapeXml(s.note) : ''}</title></circle>`
-        acc += raw
-        return el
-      })
-      .join('')
-  }
-  const label = center
-    ? `<text x="${cx}" y="${(center.sub ? cy + 2 : cy + 5).toFixed(1)}" text-anchor="middle" class="ink strong" style="font-size:13px">${escapeXml(center.top)}</text>` +
-      (center.sub
-        ? `<text x="${cx}" y="${(cy + 15).toFixed(1)}" text-anchor="middle" style="font-size:10px">${escapeXml(center.sub)}</text>`
-        : '')
-    : ''
-  return svg(S, S, track + arcs + label)
-}
 
-/**
- * 一个额度窗口：上行左边窗口名、右边「重置时刻  百分比」，下行进度条。
- * 文字和进度条画在同一张图里，百分比总是落在进度条右端正上方，不受面板宽度估算误差影响。
- */
-export function quotaSvg(
-  name: string,
-  reset: string,
-  percent: string,
-  fraction: number,
-  color: string,
-  width = 400,
-  percentColor?: string,
-  isStale = false,
-): string {
-  const W = clampW(width, 160)
-  const barY = 24
-  const barH = 6
-  const H = barY + barH
-  const f = Math.min(1, Math.max(0, fraction))
-  // 非当前账号的旧读数：只把进度条调淡，文字保持清楚
-  const fill = f > 0 ? `<rect y="${barY}" width="${Math.max(barH, f * W).toFixed(1)}" height="${barH}" rx="3" fill="${color}"${isStale ? ' opacity="0.55"' : ''}/>` : ''
-  // 中文按 13px、其余按 7.5px 估算百分比文字宽度，重置时刻紧贴在它左边
-  const pctW = Math.max(28, [...percent].reduce((a, ch) => a + (/[\u4e00-\u9fff]/.test(ch) ? 13 : 7.5), 0))
-  return svg(
-    W,
-    H,
-    `<text x="0" y="14" class="ink" style="font-size:13px">${escapeXml(name)}</text>` +
-      `<text x="${W - pctW - 8}" y="14" text-anchor="end" style="font-size:13px">${escapeXml(reset)}</text>` +
-      `<text x="${W}" y="14" text-anchor="end" ${percentColor ? `fill="${percentColor}"` : 'class="ink"'} style="font-size:13px">${escapeXml(percent)}</text>` +
-      `<rect y="${barY}" width="${W}" height="${barH}" rx="3" class="track"/>${fill}`,
-  )
-}
 
 /** 排行行下的细进度线：轨道底色 + 实色部分（单行大量渲染，用精简样式） */
 const LINE_STYLE = `<style>:root{--track:#EDEDED}@media (prefers-color-scheme:dark){:root{--track:#363636}}.track{fill:var(--track)}</style>`
@@ -314,65 +243,79 @@ export function contextTrendSvg(values: number[], window: number, compactAt: num
 }
 
 /**
- * 每日 token：细折线 + 浅色填充，日均画虚线。横轴只标首、中、尾三个日期，图内不标数字。
- * 悬停每天的竖条看明细（token、提问、等价金额）。
+ * 横向铺满容器的图：宽度写 100%、按 viewBox 拉伸（preserveAspectRatio="none"），高度固定。
+ * 插件只能按字符列估算像素宽度，估小右边留空、估大会把卡片撑出面板；拉伸后两种问题都没有。
+ * 只适合没有文字的图（文字会被横向拉变形），日期等标注放在图外用文字元素画。
  */
-export function dailyTokenSvg(series: DayPoint[], width = 520, height = 120, showMoney = true): string {
-  const W = clampW(width, 240)
-  const H = Math.max(90, Math.round(height))
-  if (series.length === 0) return svg(W, H, '')
-  const top = 6
-  const bottom = 20
-  const plotH = H - top - bottom
-  const n = series.length
+function fluidSvg(w: number, h: number, body: string): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" data-fluid="1" width="100%" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="display:block">${STYLE}${body}</svg>`
+}
+/** 铺满图的高度（像素）；不是铺满图时为 undefined */
+export function fluidHeight(source: string): number | undefined {
+  if (!source.includes('data-fluid="1"')) return undefined
+  const m = /\sheight="(\d+(?:\.\d+)?)"/.exec(source)
+  return m ? Number(m[1]) : undefined
+}
+
+/**
+ * 每日 token：一天一根柱，日均画虚线。今天还没过完（endsToday），柱子画浅色，避免看成「跳水」。
+ * 横向铺满卡片；日期标注不在图里（会被拉伸变形），由调用方在图下用文字画。
+ * 悬停柱子看当天明细（token、提问、等价金额）。
+ */
+export function dailyTokenSvg(series: DayPoint[], height = 100, showMoney = true, endsToday = true): string {
+  const n = Math.max(1, series.length)
+  // viewBox 宽度：每天 10 个单位，柱占 6
+  const W = n * 10
+  const H = Math.max(60, Math.round(height))
+  if (series.length === 0) return fluidSvg(W, H, '')
+  const top = 4
+  const base = H - 1
+  const plotH = base - top
   const max = Math.max(1, ...series.map(s => s.tokens)) * 1.08
-  const x = (i: number) => (n === 1 ? W / 2 : (i / (n - 1)) * W)
-  const y = (v: number) => top + plotH - (v / max) * plotH
-  const pts = series.map((s, i) => `${x(i).toFixed(1)},${y(s.tokens).toFixed(1)}`).join(' ')
-  const base = top + plotH
-  const area = `<polygon points="0,${base} ${pts} ${W},${base}" fill="${ACCENT}" opacity="0.12"/>`
-  const line = `<polyline points="${pts}" fill="none" stroke="${ACCENT}" stroke-width="1.5" stroke-linejoin="round"/>`
   const avg = series.reduce((a, s) => a + s.tokens, 0) / n
-  const avgLine = avg > 0 ? `<line x1="0" x2="${W}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke="${GREY}" stroke-width="1" stroke-dasharray="3 3" opacity="0.8"/>` : ''
-  const axis = `<line class="grid" x1="0" x2="${W}" y1="${base}" y2="${base}" stroke-width="1"/>`
-  const label = (i: number, anchor: string) => {
-    const s = series[i]!
-    const text = i === n - 1 ? '今天' : s.day.slice(5).replace('-', '/')
-    return `<text x="${x(i).toFixed(1)}" y="${H - 4}" text-anchor="${anchor}">${text}</text>`
-  }
-  const labels = n > 2 ? label(0, 'start') + label(Math.floor((n - 1) / 2), 'middle') + label(n - 1, 'end') : label(n - 1, 'end')
-  const slot = W / n
-  const hits = series
+  const y = (v: number) => base - (v / max) * plotH
+  const bars = series
     .map((s, i) => {
-      const tip = `${s.day}\n${fmtTokens(s.tokens)} token · ${s.prompts} 次提问${showMoney ? ` · ≈ ${fmtUsd(s.usd)}` : ''}`
-      return `<rect x="${(x(i) - slot / 2).toFixed(1)}" y="${top}" width="${slot.toFixed(1)}" height="${plotH}" fill="transparent"><title>${escapeXml(tip)}</title></rect>`
+      const isToday = endsToday && i === n - 1
+      const h = Math.max((s.tokens / max) * plotH, s.tokens > 0 ? 2 : 0)
+      const tip = `${isToday ? '今天（进行中）' : s.day}\n${fmtTokens(s.tokens)} token · ${s.prompts} 次提问${showMoney ? ` · ≈ ${fmtUsd(s.usd)}` : ''}`
+      return (
+        `<g><title>${escapeXml(tip)}</title>` +
+        `<rect x="${i * 10}" y="${top}" width="10" height="${plotH}" fill="transparent"/>` +
+        `<rect x="${i * 10 + 2}" y="${(base - h).toFixed(1)}" width="6" height="${h.toFixed(1)}" fill="${ACCENT}"${isToday ? ' opacity="0.4"' : ''}/></g>`
+      )
     })
     .join('')
-  return svg(W, H, area + avgLine + axis + line + labels + hits)
+  const avgLine =
+    avg > 0
+      ? `<line x1="0" x2="${W}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke="${GREY}" stroke-width="1" stroke-dasharray="3 3" opacity="0.8" vector-effect="non-scaling-stroke"/>`
+      : ''
+  const axis = `<line class="grid" x1="0" x2="${W}" y1="${base}" y2="${base}" stroke-width="1" vector-effect="non-scaling-stroke"/>`
+  return fluidSvg(W, H, axis + bars + avgLine)
 }
 
-/** 工具行中间的双条：上为 token 占比、下为次数占比（同色，次数那根淡一些） */
-export function dualBarSvg(tokenShare: number, countShare: number, color: string, width = 120): string {
-  const W = clampW(width, 40)
-  const bar = (f: number, yy: number, op: string) =>
-    `<rect y="${yy}" width="${W}" height="3" rx="1.5" class="track"/>` +
-    (f > 0 ? `<rect y="${yy}" width="${Math.max(2, Math.min(1, f) * W).toFixed(1)}" height="3" rx="1.5" fill="${color}"${op}/>` : '')
-  return svg(W, 8, bar(tokenShare, 0, '') + bar(countShare, 5, ' opacity="0.4"'))
-}
 
-/** 构成表上方的细分段条（与 /context 的用量条同风格）：4px 高，段间留 2px 缝 */
-export function thinStackSvg(segs: { value: number; color: string }[], width = 400): string {
-  const W = clampW(width, 80)
+/** 构成表上方的细分段条（与 /context 的用量条同风格）：4px 高，横向铺满，段间留缝 */
+export function thinStackSvg(segs: { value: number; color: string }[]): string {
+  const W = 1000
   const total = segs.reduce((a, s) => a + Math.max(0, s.value), 0)
   let x = 0
   const body = segs
     .filter(s => s.value > 0 && total > 0)
     .map(s => {
       const w = (s.value / total) * W
-      const el = `<rect x="${x.toFixed(1)}" width="${Math.max(1.5, w - 2).toFixed(1)}" height="4" rx="2" fill="${s.color}"/>`
+      const el = `<rect x="${x.toFixed(1)}" width="${Math.max(2, w - 3).toFixed(1)}" height="4" fill="${s.color}"/>`
       x += w
       return el
     })
     .join('')
-  return svg(W, 4, `<rect width="${W}" height="4" rx="2" class="track"/>${body}`)
+  return fluidSvg(W, 4, `<rect width="${W}" height="4" class="track"/>${body}`)
+}
+
+/** 额度进度条：6px 高，横向铺满所在列；非当前账号的旧读数把填充调淡 */
+export function fluidBarSvg(fraction: number, color: string, isStale = false): string {
+  const W = 1000
+  const f = Math.min(1, Math.max(0, fraction))
+  const fill = f > 0 ? `<rect width="${Math.max(6, f * W).toFixed(1)}" height="6" fill="${color}"${isStale ? ' opacity="0.55"' : ''}/>` : ''
+  return fluidSvg(W, 6, `<rect width="${W}" height="6" class="track"/>${fill}`)
 }

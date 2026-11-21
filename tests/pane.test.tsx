@@ -54,7 +54,7 @@ test('面板在四种绘制端都能画出组成、成本、额度和命令统�
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...store.keys()] }))
-  on('command.register', () => ({ value: { command: 'ctx-insights' } }))
+  on('command.register', () => ({ value: { command: 'ctx' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.usage', () => ({
     value: {
@@ -73,8 +73,8 @@ test('面板在四种绘制端都能画出组成、成本、额度和命令统�
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'Bash', command: 'cd /tmp && git status' })
   await $.tool.call({ tool: 'Bash', command: 'FOO=1 /usr/bin/npm test' })
-  // 面板默认是洞察总览；/ctx-insights full 直接进入当前会话的上下文
-  await $.command.run({ command: 'ctx-insights', args: 'full' })
+  // 面板默认是洞察总览；/ctx full 直接进入当前会话的上下文
+  await $.command.run({ command: 'ctx', args: 'full' })
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -106,14 +106,14 @@ test('面板默认是洞察总览，没有顶部标签；返回按钮从会话�
   on('ui.log', () => ({ value: undefined }))
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Button', text: /^本会话$/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Button', text: /^近 7 天$/ })).toBeDefined()
+  expect((await ui.find({ type: 'Select', key: 'range' }))?.props.value).toBe('7d')
   expect(await ui.find({ type: 'Button', text: /返回洞察/ })).toBeUndefined()
   // 进入当前会话，再返回
-  await $.command.run({ command: 'ctx-insights', args: 'full' })
+  await $.command.run({ command: 'ctx', args: 'full' })
   expect((await ui.find({ type: 'Text', text: /^已使用/ }))?.text).toContain('已使用')
   await ui.press({ key: 'back' })
   expect(await ui.find({ type: 'Text', text: /^已使用/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Button', text: /^近 7 天$/ })).toBeDefined()
+  expect((await ui.find({ type: 'Select', key: 'range' }))?.props.value).toBe('7d')
   await ui.unmount()
 })
 
@@ -123,8 +123,28 @@ test('没有数据时给出提示', async ($, on) => {
   on('session.id', () => ({ value: 'cur' }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.log', () => ({ value: undefined }))
-  await $.command.run({ command: 'ctx-insights', args: 'full' })
+  await $.command.run({ command: 'ctx', args: 'full' })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /发一条消息后自动统计/ }))?.text).toContain('自动统计')
+  await ui.unmount()
+})
+
+test('关闭面板：/ctx close 与面板里的 ✕ 都调 ui.close', async ($, on) => {
+  on('agent.list', () => ({ value: [] }))
+  on('clock.now', () => ({ value: 1000 }))
+  on('session.usage', () => ({ value: { ...USAGE, rateLimits: [] } }))
+  on('session.id', () => ({ value: 'cur' }))
+  on('store.get', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.log', () => ({ value: undefined }))
+  const closed: string[] = []
+  on('ui.close', (_, e) => {
+    closed.push(e.id)
+    return { value: undefined }
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'close-pane' })
+  await $.command.run({ command: 'ctx', args: 'close' })
+  expect(closed).toEqual(['cc-context-insights', 'cc-context-insights'])
   await ui.unmount()
 })
