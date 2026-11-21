@@ -295,3 +295,59 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
   expect(await ui.find({ type: 'Text', text: /测试会话标题/ })).toBeUndefined()
   await ui.unmount()
 })
+
+test('单个日志文件读取被宿主拒绝时跳过它，其他会话照常统计', async ($, on) => {
+  const store = new Map<string, unknown>()
+  on('clock.now', () => ({ value: NOW }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
+  on('fs.list', (_, e) => {
+    if (e.path === '/h/.claude/projects') return { value: [{ name: '-Users-me-crm', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }
+    if (e.path === '/h/.claude/projects/-Users-me-crm')
+      return {
+        value: [
+          { name: 'big.jsonl', kind: 'file', size: 32_000_000, mtimeMs: 0, isLink: false },
+          { name: 's1.jsonl', kind: 'file', size: SIZE, mtimeMs: 0, isLink: false },
+        ],
+      }
+    return { value: [] }
+  })
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('big.jsonl')) throw new Error('refused: the file is over the 4194304-byte limit')
+    if (!e.path.endsWith('.jsonl')) return { value: '' }
+    const bytes = new TextEncoder().encode(LOG).subarray(e.offset ?? 0, (e.offset ?? 0) + (e.length ?? SIZE))
+    let bin = ''
+    for (const b of bytes) bin += String.fromCharCode(b)
+    return { value: { base64: btoa(bin) } }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.log', () => ({ value: undefined }))
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], context: { window: 200000 } } }))
+  on('agent.list', () => ({ value: [] }))
+  on('session.id', () => ({ value: 'cur' }))
+  on('fs.stat', (_, e) => ({
+    value: { kind: 'file', size: e.path.endsWith('big.jsonl') ? 32_000_000 : SIZE, mtimeMs: 0, isLink: false },
+  }))
+
+  await $.command.run({ command: 'ctx', args: '' })
+  for (let i = 0; i < 5000 && !store.has('agg6:/h/.claude/projects/-Users-me-crm/s1.jsonl'); i++) await new Promise<void>(r => r())
+  for (let i = 0; i < 2000; i++) await new Promise<void>(r => r())
+
+  const agg = store.get('agg6:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
+  expect(agg.weight).toBe(1120)
+  expect(store.has('agg6:/h/.claude/projects/-Users-me-crm/big.jsonl')).toBe(false)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /扫描出错/ })).toBeUndefined()
+  await ui.unmount()
+})

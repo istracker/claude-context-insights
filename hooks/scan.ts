@@ -434,13 +434,20 @@ export async function runScan($: EngineInterface): Promise<void> {
     let doneBytes = 0
     for (const t of todo) {
       const agg = cached.get(t.file) ?? emptyAgg(t.id, t.file, t.isSub)
-      await scanFile($, agg, t.size, tzMin, async n => {
-        doneBytes += n
-        // 大文件分块读时实时推进进度条，小文件随批次统一刷，减少重渲染风暴
-        if (t.size > CHUNK) await setScan(s => ({ ...s, doneBytes }))
-      })
-      cached.set(t.file, agg)
-      await $.store.set(STORE_PREFIX + t.file, agg)
+      const before = doneBytes
+      try {
+        await scanFile($, agg, t.size, tzMin, async n => {
+          doneBytes += n
+          // 大文件分块读时实时推进进度条，小文件随批次统一刷，减少重渲染风暴
+          if (t.size > CHUNK) await setScan(s => ({ ...s, doneBytes }))
+        })
+        cached.set(t.file, agg)
+        await $.store.set(STORE_PREFIX + t.file, agg)
+      } catch {
+        // 单个文件读不了（如宿主拒绝读取超过 4 MiB 的文件）就跳过，不影响其他会话的统计
+        const prevOff = cached.get(t.file)?.offset ?? 0
+        doneBytes = before + (t.size < prevOff ? t.size : t.size - prevOff)
+      }
       done += 1
       // 每处理 5 个文件刷一次进度与会话列表
       if (done % 5 === 0 || done === todo.length) {
