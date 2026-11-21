@@ -1070,7 +1070,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     ]
     const avgTokens = series.length > 0 ? series.reduce((a, x) => a + x.tokens, 0) / series.length : 0
     /** 柱图下的首、中、尾三个日期 */
-    const axisLabel = (i: number) => (seriesFrom === 0 && i === series.length - 1 ? '今天' : (series[i]?.day ?? '').slice(5).replace('-', '/'))
+    const axisLabel = (i: number) => (series[i]?.day ?? '').slice(5).replace('-', '/')
     const axisDays = series.length > 2 ? [axisLabel(0), axisLabel(Math.floor((series.length - 1) / 2)), axisLabel(series.length - 1)] : series.map((_, i) => axisLabel(i))
 
     /** 时间范围下拉：只写名称；具体日期写在用量卡的副标题里 */

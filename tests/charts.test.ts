@@ -28,7 +28,10 @@ test('每日 token 柱图：铺满宽度、空序列与全零不产生 NaN，金
   expect(zero).not.toContain('NaN')
   const s = dailyTokenSvg([day('2026-11-20', 1000), day('2026-11-21', 3000)], 100, false)
   expect(s).toContain('width="100%"')
-  expect(s).toContain('今天（进行中）')
+  expect(s).toContain('（今天，进行中）')
+  // 悬停提示用 CSS :hover 立即显示，不用系统 <title>
+  expect(s).toContain('.h1:hover~.t1{visibility:visible}')
+  expect(s).not.toContain('<title>')
   expect(s).toContain('opacity="0.4"')
   expect(s).not.toContain('$')
   // 不以今天结尾（如「上月」）：没有浅色柱

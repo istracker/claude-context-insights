@@ -258,40 +258,75 @@ export function fluidHeight(source: string): number | undefined {
 }
 
 /**
+ * 按百分比布局、横向铺满容器的图（不用 viewBox，不拉伸）：x、宽度写百分比，y、高度写像素，
+ * 文字不会被拉变形，所以可以在图里画悬停提示。
+ */
+function fluidPctSvg(h: number, extraStyle: string, body: string): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" data-fluid="1" width="100%" height="${h}" style="display:block;overflow:visible">${STYLE}<style>${extraStyle}</style>${body}</svg>`
+}
+
+/** 悬停提示框的大致宽度：中文按 12px、其余按 7px，两侧各留 8px */
+function tipWidth(lines: string[]): number {
+  const w = (t: string) => [...t].reduce((a, ch) => a + (/[\u2E80-\u9FFF\uFF00-\uFFEF]/.test(ch) ? 12 : 7), 0)
+  return Math.max(...lines.map(w)) + 16
+}
+
+/**
  * 每日 token：一天一根柱，日均画虚线。今天还没过完（endsToday），柱子画浅色，避免看成「跳水」。
- * 横向铺满卡片；日期标注不在图里（会被拉伸变形），由调用方在图下用文字画。
- * 悬停柱子看当天明细（token、提问、等价金额）。
+ * 横向铺满卡片；日期标注由调用方在图下用文字画。
+ * 悬停柱子立即显示当天明细（CSS :hover，不用 <title>：系统提示要停留约一秒才出现）。
  */
 export function dailyTokenSvg(series: DayPoint[], height = 100, showMoney = true, endsToday = true): string {
-  const n = Math.max(1, series.length)
-  // viewBox 宽度：每天 10 个单位，柱占 6
-  const W = n * 10
+  const n = series.length
   const H = Math.max(60, Math.round(height))
-  if (series.length === 0) return fluidSvg(W, H, '')
+  if (n === 0) return fluidPctSvg(H, '', '')
   const top = 4
   const base = H - 1
   const plotH = base - top
   const max = Math.max(1, ...series.map(s => s.tokens)) * 1.08
   const avg = series.reduce((a, s) => a + s.tokens, 0) / n
   const y = (v: number) => base - (v / max) * plotH
+  const slot = 100 / n
+  const pc = (v: number) => `${v.toFixed(3)}%`
+  // 悬停区（每天一整列）在最下层接住指针；柱子不接指针；提示框在最上层，按序号与悬停区配对显示
+  const hits = series
+    .map((_, i) => `<rect class="h${i}" x="${pc(i * slot)}" y="0" width="${pc(slot)}" height="${H}" fill="transparent"/>`)
+    .join('')
   const bars = series
     .map((s, i) => {
       const isToday = endsToday && i === n - 1
       const h = Math.max((s.tokens / max) * plotH, s.tokens > 0 ? 2 : 0)
-      const tip = `${isToday ? '今天（进行中）' : s.day}\n${fmtTokens(s.tokens)} token · ${s.prompts} 次提问${showMoney ? ` · ≈ ${fmtUsd(s.usd)}` : ''}`
-      return (
-        `<g><title>${escapeXml(tip)}</title>` +
-        `<rect x="${i * 10}" y="${top}" width="10" height="${plotH}" fill="transparent"/>` +
-        `<rect x="${i * 10 + 2}" y="${(base - h).toFixed(1)}" width="6" height="${h.toFixed(1)}" fill="${ACCENT}"${isToday ? ' opacity="0.4"' : ''}/></g>`
-      )
+      return `<rect class="b b${i}" x="${pc(i * slot + slot * 0.2)}" y="${(base - h).toFixed(1)}" width="${pc(slot * 0.6)}" height="${h.toFixed(1)}" fill="${ACCENT}"${isToday ? ' opacity="0.4"' : ''}/>`
     })
     .join('')
   const avgLine =
     avg > 0
-      ? `<line x1="0" x2="${W}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke="${GREY}" stroke-width="1" stroke-dasharray="3 3" opacity="0.8" vector-effect="non-scaling-stroke"/>`
+      ? `<line x1="0" x2="100%" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke="${GREY}" stroke-width="1" stroke-dasharray="3 3" opacity="0.8" pointer-events="none"/>`
       : ''
-  const axis = `<line class="grid" x1="0" x2="${W}" y1="${base}" y2="${base}" stroke-width="1" vector-effect="non-scaling-stroke"/>`
-  return fluidSvg(W, H, axis + bars + avgLine)
+  const axis = `<line class="grid" x1="0" x2="100%" y1="${base}" y2="${base}" stroke-width="1" pointer-events="none"/>`
+  const tips = series
+    .map((s, i) => {
+      const isToday = endsToday && i === n - 1
+      const l1 = isToday ? `${s.day}（今天，进行中）` : s.day
+      const l2 = `${fmtTokens(s.tokens)} token · ${s.prompts} 次提问${showMoney ? ` · ≈ ${fmtUsd(s.usd)}` : ''}`
+      const w = tipWidth([l1, l2])
+      // 左半边的柱子提示框向右展开，右半边的向左展开，不出图
+      const isRight = i >= n / 2
+      const anchor = pc(isRight ? i * slot : (i + 1) * slot)
+      const x0 = isRight ? -w - 4 : 4
+      return (
+        `<svg class="t t${i}" x="${anchor}" y="2" overflow="visible">` +
+        `<rect x="${x0}" y="0" width="${w}" height="38" rx="4" class="tipbg"/>` +
+        `<text x="${x0 + 8}" y="15" class="ink">${escapeXml(l1)}</text>` +
+        `<text x="${x0 + 8}" y="31" class="ink strong">${escapeXml(l2)}</text></svg>`
+      )
+    })
+    .join('')
+  const css =
+    '.b,.t{pointer-events:none}.t{visibility:hidden}' +
+    '.tipbg{fill:#FFFFFF;stroke:#D9D9D9}@media (prefers-color-scheme:dark){.tipbg{fill:#2A2A2A;stroke:#444444}}' +
+    series.map((_, i) => `.h${i}:hover~.t${i}{visibility:visible}.h${i}:hover~.b${i}{opacity:.75}`).join('')
+  return fluidPctSvg(H, css, hits + axis + bars + avgLine + tips)
 }
 
 

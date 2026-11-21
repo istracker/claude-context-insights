@@ -2,7 +2,7 @@
   "name": "cc-context-insights",
   "displayName": "上下文洞察",
   "version": "0.1.0",
-  "description": "专为 Claude Code / Claude Desktop 设计的上下文洞察面板：订阅额度、成本与 token、会话与活动，双击会话查看它的上下文（非官方）",
+  "description": "在 Claude Code 旁打开一个面板：订阅额度还剩多少、最近用了多少 token、哪些会话在消耗它们。数据只在本机读取与计算（非官方）",
   "author": {
     "name": "Lcp"
   },

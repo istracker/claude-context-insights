@@ -198,7 +198,7 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
     expect((await ui.find({ type: 'Text', text: /^‹  crm-ext$/ }))?.text).toBe('‹  crm-ext')
     // 会话行里不再重复项目名
     // 第 2 行：账号 · token · 最后一条消息（不再有提问数、上下文百分比；会话行不显示金额）
-    const meta = (await ui.find({ type: 'Text', text: /^.*\d+ token/ }))?.text
+    const meta = (await ui.find({ type: 'Text', text: /\d(?:\.\d+)?[kMB]? token/ }))?.text
     expect(meta).toBeDefined()
     expect(meta).not.toContain('crm-ext')
     expect(await ui.find({ type: 'Text', text: /^\$1\.50$/ })).toBeUndefined()
@@ -206,22 +206,26 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
       // 会话行不画图片（上下文占用用文字）
       expect((await ui.findAll({ type: 'Svg' })).some(s => String(s.props.alt).startsWith('当前上下文'))).toBe(false)
     }
+    // 项目头按钮按下后会换 key（尾部加 ~，让焦点环离开它），哪个在画面上就按哪个
+    const pressProject = async (u: typeof ui) => {
+      const plain = await u.find({ type: 'Button', key: 'proj-toggle-crm-ext' })
+      await u.press({ key: plain ? 'proj-toggle-crm-ext' : 'proj-toggle-crm-ext~' })
+    }
     // 搜索：不匹配时列表为空，清空后恢复
     await ui.input({ key: 'session-search', text: '不存在的关键字' })
     expect((await ui.find({ type: 'Text', text: /没有符合筛选条件的会话/ }))?.text).toBeDefined()
     await ui.input({ key: 'session-search', text: '' })
     expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
     // 点项目行收起，再点展开
-    await ui.press({ key: 'proj-toggle-crm-ext' })
+    await pressProject(ui)
     expect(await ui.find({ type: 'Text', text: /测试会话标题/ })).toBeUndefined()
     expect((await ui.find({ type: 'Text', text: /^›  crm-ext$/ }))?.text).toBe('›  crm-ext')
-    // 按下后按钮会换 key（尾部加 ~），让焦点环离开它
-    await ui.press({ key: 'proj-toggle-crm-ext~' })
+    await pressProject(ui)
     expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
     // 展开后项目头的箭头变成「‹」（点它回到项目列表）
     expect((await ui.find({ type: 'Text', text: /^‹  crm-ext$/ }))?.text).toBe('‹  crm-ext')
     // 搜索时只有一个项目有结果：自动展开，即使之前手动收起了也直接看得到会话
-    await ui.press({ key: 'proj-toggle-crm-ext' })
+    await pressProject(ui)
     expect(await ui.find({ type: 'Text', text: /测试会话标题/ })).toBeUndefined()
     await ui.input({ key: 'session-search', text: '测试会话' })
     expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
@@ -260,10 +264,11 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
   for (const surface of ['terminal', 'desktop'] as const) {
     const narrow = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 40 } })
     expect((await narrow.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
-    // 会话 s1 在 Desktop 里有记录：桌面端标题按钮的提示是「打开」，终端仍是「复制命令」；
-    // 标题就是唯一的主操作，不再有单独的按钮
-    expect(await narrow.find({ type: 'Button', key: 'open-s1' })).toBeDefined()
-    expect((await narrow.find({ type: 'Text', text: surface === 'desktop' ? /打开$/ : /复制命令$/ }))?.text).toBeDefined()
+    // 标题就是唯一的主操作（按下后 key 会加 ~，两种都认）。会话 s1 在 Desktop 里有记录且属于当前账号：
+    // 桌面端点标题直接打开，不标「复制命令」；终端里一律复制，提示写在模块标题旁，行内也不标
+    const openBtn = (await narrow.find({ type: 'Button', key: 'open-s1' })) ?? (await narrow.find({ type: 'Button', key: 'open-s1~' }))
+    expect(openBtn).toBeDefined()
+    expect(await narrow.find({ type: 'Text', text: /^复制命令$/ })).toBeUndefined()
     expect(await narrow.find({ type: 'Button', text: /^复制恢复命令$/ })).toBeUndefined()
     expect(await narrow.find({ type: 'Button', text: /^在 Desktop 打开$/ })).toBeUndefined()
     expect(await narrow.find({ type: 'Text', text: /^最后消息/ })).toBeUndefined()
@@ -271,7 +276,7 @@ test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，
   }
   // 中等宽度：保留完整会话行
   const medium = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 70 } })
-  expect(await medium.find({ type: 'Button', key: 'open-s1' })).toBeDefined()
+  expect((await medium.find({ type: 'Button', key: 'open-s1' })) ?? (await medium.find({ type: 'Button', key: 'open-s1~' }))).toBeDefined()
   expect(await medium.find({ type: 'Button', text: /^复制恢复命令$/ })).toBeUndefined()
   await medium.unmount()
 

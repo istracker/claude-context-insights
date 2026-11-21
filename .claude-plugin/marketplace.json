@@ -1,12 +1,15 @@
 {
   "name": "cc-context-insights-local",
   "description": "cc-context-insights 上下文洞察插件的本地与 GitHub 分发清单",
-  "owner": { "name": "Lcp" },
+  "owner": {
+    "name": "Lcp"
+  },
   "plugins": [
     {
       "name": "cc-context-insights",
       "source": "./",
-      "description": "上下文洞察面板：订阅额度、成本与 token、会话与活动（非官方）"
+      "description": "在 Claude Code 旁打开一个面板：订阅额度、token 用量与会话（非官方）",
+      "displayName": "上下文洞察"
     }
   ]
 }
