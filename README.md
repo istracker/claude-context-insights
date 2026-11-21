@@ -33,19 +33,19 @@
 
 ## 安装
 
-从 GitHub 安装：
+从 GitHub 安装：先添加插件市场，再安装插件。
 
 ```bash
-claude plugin install cc-context-insights --marketplace istracker/claude-context-insights
+claude plugin marketplace add istracker/claude-context-insights
 ```
-
-在 Claude Code 会话里也可以运行 `/plugin install cc-context-insights --marketplace istracker/claude-context-insights`。
-
-从本地克隆的仓库安装（改代码后执行 `/reload-plugins` 生效）：
 
 ```bash
-claude plugin install cc-context-insights --marketplace /path/to/claude-context-insights
+claude plugin install cc-context-insights@cc-context-insights
 ```
+
+在 Claude Code 会话里也可以分别运行 `/plugin marketplace add istracker/claude-context-insights` 和 `/plugin install cc-context-insights@cc-context-insights`。
+
+从本地克隆的仓库安装（改代码后执行 `/reload-plugins` 生效）：把第一条命令里的 `istracker/claude-context-insights` 换成仓库所在目录的路径，第二条不变。
 
 ## 数据从哪来、去哪里
 

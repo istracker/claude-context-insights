@@ -177,6 +177,17 @@ async function refresh($: EngineInterface, detail: 'summary' | 'full'): Promise<
 
 // ---------- 注册 ----------
 
+/**
+ * 面板打开了但还没画出来时，给用户看的话（宿主的 reason 是给开发者看的英文）。
+ * 两种情况面板都保持打开，条件满足后宿主会自动画出来，不用再运行命令：
+ * - `no-surface`：还没有界面连上本会话（如 Desktop 刚重载插件、窗口还在连接）
+ * - 其余：终端太窄，reason 里写着需要的列数与当前列数
+ */
+export function notPlacedText(reason: string): string {
+  if (reason.startsWith('no-surface')) return '上下文洞察已打开，界面连上后会自动显示；如果一直没出现，稍等几秒再运行 /ctx。'
+  return `上下文洞察已打开，窗口加宽后会自动显示（${reason}）。`
+}
+
 export const register: Register = on => {
   /**
    * /ctx 是面板唯一的入口（命令在 startInsights 里注册）：
@@ -201,7 +212,7 @@ export const register: Register = on => {
     return {
       text:
         opened?.isPlaced === false
-          ? `上下文洞察暂未显示：${opened.reason}`
+          ? notPlacedText(opened.reason)
           : isFull
             ? '已打开上下文洞察，正在精确统计本会话的上下文。'
             : '已打开上下文洞察。',
