@@ -74,7 +74,6 @@ export type DayAgg = {
   tools: Record<string, number>
   /** 各工具当天往上下文塞入的估算 token（入参 + 返回结果按 4 字符≈1 token 折算） */
   toolTokens?: Record<string, number>
-  skills: Record<string, number>
 }
 
 /** 一个日志文件（主会话或子 Agent）的汇总，存在 $.store 里，跨会话保留 */
@@ -94,6 +93,8 @@ export type SessionAgg = {
   cwd?: string
   title?: string
   lastPrompt?: string
+  /** 最后一次请求的上下文大小（输入 + 缓存读 + 缓存写），即会话当前占用的上下文 */
+  lastCtx?: number
   firstAt?: number
   lastAt?: number
   /** cost-state 记录的会话总成本（含子 Agent），本地估算 */
@@ -103,14 +104,6 @@ export type SessionAgg = {
   /** 读到最后一条 cost-state 时的权重累计；之后的部分要另行估算 */
   costAtWeight?: number
   days: Record<string, DayAgg>
-}
-
-/** 从日志还原的一次请求 */
-export type DetailRequest = {
-  at: number
-  /** 这次请求的上下文大小 = 输入 + 缓存读 + 缓存写 */
-  ctx: number
-  out: number
 }
 
 /** 上下文骤降事件（压缩或清空） */
@@ -124,28 +117,6 @@ export type ContextDrop = {
 
 /** 文件活动筛选 */
 export type FileFilter = 'all' | 'read' | 'write'
-
-/** 双击会话后看到的上下文详情（非当前会话，从日志还原） */
-export type SessionDetail = {
-  id: string
-  status: 'loading' | 'ready' | 'error'
-  error?: string
-  doneBytes: number
-  totalBytes: number
-  /** 逐请求的上下文大小，超过 400 个时按时间均匀抽样 */
-  requests: DetailRequest[]
-  requestCount: number
-  model?: string
-  lastCtx: number
-  maxCtx: number
-  /** 上下文骤降（被压缩或清空）的次数 */
-  compactions: number
-  /** 上下文骤降事件明细（时间与前后 token） */
-  drops: ContextDrop[]
-  tools: Record<string, number>
-  programs: Record<string, number>
-  files: Record<string, { r: number; w: number }>
-}
 
 /** 一个订阅额度窗口 */
 export type RateWindow = {
@@ -174,7 +145,23 @@ export type ScanState = {
 }
 
 export type InsightRange = 'today' | '7d' | '30d' | 'all'
-export type InsightSort = 'recent' | 'tokens' | 'cost'
+/** 顶部页签 */
+export type InsightTab = 'overview' | 'sessions' | 'tools' | 'settings'
+
+/** 插件设置：跨会话保存在 $.store */
+export type InsightSettings = {
+  /** 是否显示等价 API 金额，默认显示 */
+  showMoney?: boolean
+  /** 不统计的项目名 */
+  excluded?: string[]
+  /** 账号显示名：账号 id → 显示名，优先于 accounts.json */
+  aliases?: Record<string, string>
+}
+
+/** 花费构成的维度 */
+export type Breakdown = 'type' | 'model' | 'account'
+
+export type InsightSort = 'recent' | 'tokens' | 'cost' | 'context'
 
 export type InsightView = {
   range: InsightRange
@@ -187,8 +174,20 @@ export type InsightView = {
   page?: number
   /** 会话列表按项目分组筛选 */
   project?: string
-  /** 是否展开「更多」：项目、时段、工具、命令等 */
-  showActivity?: boolean
+  /** 顶部页签：总览、会话、工具 */
+  tab?: InsightTab
+  /** 会话按项目分组：展开的项目（手风琴，只取第一个；不填时默认展开第一个项目） */
+  openProjects?: string[]
+  /** 展开项目里的会话页码（从 0 开始） */
+  sessionPage?: number
+  /** 每次展开/翻页加一：用来给按钮换 key，让宿主的焦点环离开已按下的按钮（见 insights 里的 fk） */
+  focusEpoch?: number
+  /** 会话搜索：按标题、项目、最后消息过滤 */
+  query?: string
+  /** 花费卡片的构成表看哪个维度 */
+  breakdown?: Breakdown
+  /** 工具上下文排序：累计 token 或平均每次 */
+  toolSort?: 'total' | 'avg'
   /** 账号筛选：账号 id，'none' 为未归属；不填为全部 */
   account?: string
   /** 排行里点选的一项：会话列表只列用过它的会话 */
@@ -202,17 +201,23 @@ export type InsightView = {
 }
 
 /** 「更多」里可点选筛选的排行 */
-export type RankKind = 'proj' | 'model' | 'tool' | 'skill'
+export type RankKind = 'model' | 'tool'
 
 /** 账号的显示信息，见过一次就记住 */
 export type AccountLabel = {
   email?: string
+  /** 设置里填的显示名，优先于邮箱 */
+  alias?: string
   name?: string
 }
 
 /** 会话 → 账号：来自 Claude Desktop 的 claude-code-sessions/<账号>/<组织>/local_*.json */
 export type AccountMap = {
   bySession: Record<string, string>
+  /** CLI 会话 id → Claude Desktop 里的会话 id（local_…），用来在 Desktop 里直接打开该会话 */
+  desktopBySession: Record<string, string>
+  /** CLI 会话 id → Desktop 里的标题与归档状态（只记当前日志 id；标题与侧边栏一致） */
+  desktopMeta?: Record<string, { title?: string; isArchived?: boolean }>
   labels: Record<string, AccountLabel>
   /** 当前登录的账号 */
   current?: string
@@ -230,17 +235,15 @@ declare module 'claude-code' {
       sessions: Shaped<SessionAgg[]>
       scan: Shaped<ScanState>
       view: Shaped<InsightView>
+      settings: Shaped<InsightSettings>
       accounts: Shaped<AccountMap>
       /** 各账号最近一次的额度读数，键为账号 id */
       limits: Shaped<Record<string, RateSnapshot>>
       /** 本会话最近一次实时拉取的额度（短期缓存，避免高频重渲染重复调 usage） */
       'live-limits': Shaped<RateSnapshot | null>
-      /** 本机已安装的技能名列表（用于找出「已装但未用」的技能） */
-      'installed-skills': Shaped<string[]>
       /** 正在查看哪个会话的上下文；null 为洞察总览 */
       focus: Shaped<string | null>
       /** 正在查看的非当前会话的详情 */
-      detail: Shaped<SessionDetail | null>
     }
   }
 }

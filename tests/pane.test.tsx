@@ -106,14 +106,14 @@ test('面板默认是洞察总览，没有顶部标签；返回按钮从会话�
   on('ui.log', () => ({ value: undefined }))
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Button', text: /^本会话$/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Button', text: /^7 天$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /^近 7 天$/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: /返回洞察/ })).toBeUndefined()
   // 进入当前会话，再返回
   await $.command.run({ command: 'ctx-insights', args: 'full' })
   expect((await ui.find({ type: 'Text', text: /^已使用/ }))?.text).toContain('已使用')
   await ui.press({ key: 'back' })
   expect(await ui.find({ type: 'Text', text: /^已使用/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Button', text: /^7 天$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /^近 7 天$/ })).toBeDefined()
   await ui.unmount()
 })
 

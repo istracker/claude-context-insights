@@ -34,7 +34,6 @@ const LOG = [
   JSON.stringify({ type: 'user', timestamp: TS, turnOrigin: 'human', cwd: '/Users/me/Developer/crm-ext', message: { content: 'hi' } }),
   asst('r1', { type: 'thinking', thinking: '' }),
   asst('r1', { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'cd x && git status' } }),
-  asst('r1', { type: 'tool_use', id: 't2', name: 'Skill', input: { skill: 'tdd' } }),
   asst('r2', { type: 'text', text: 'ok' }),
   JSON.stringify({ type: 'user', timestamp: TS, message: { content: [{ type: 'tool_result', content: '"type":"assistant"' }] } }),
   '{"type":"cost-state","sessionId":"s1","totalCostUSD":1.5}',
@@ -51,7 +50,7 @@ const LOG2 = [
 ].join('\n')
 const SIZE2 = new TextEncoder().encode(LOG2).length
 
-test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/成本，并画出面板', async ($, on) => {
+test('扫描日志：按 requestId 去重、统计工具/命令/提问/成本，并画出面板', async ($, on) => {
   const store = new Map<string, unknown>()
   on('clock.now', () => ({ value: NOW }))
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
@@ -118,7 +117,7 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
   for (let i = 0; i < 5000 && store.size === 0; i++) await new Promise<void>(r => r())
   for (let i = 0; i < 2000; i++) await new Promise<void>(r => r())
 
-  const agg = store.get('agg5:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
+  const agg = store.get('agg6:/h/.claude/projects/-Users-me-crm/s1.jsonl') as Record<string, unknown>
   // Opus 5.5 缓存读 0.05×：每次请求 10 + 200×1.25 + 1000×0.05 + 50×5 = 560，两次 1120；cost-state 在最后
   expect(agg.weight).toBe(1120)
   expect(agg.costAtWeight).toBe(1120)
@@ -129,7 +128,6 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
     cr: number
     tools: Record<string, number>
     toolTokens?: Record<string, number>
-    skills: Record<string, number>
     models: Record<string, number>
     modelWeight?: Record<string, number>
   }
@@ -142,7 +140,6 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
   expect(agg.title).toBe('测试会话标题')
   expect(day?.tools.Bash).toBe(1)
   expect(day?.toolTokens?.Bash).toBeGreaterThan(0)
-  expect(day?.skills.tdd).toBe(1)
   expect(day?.models['claude-opus-5-5']).toBe(2)
   expect(day?.modelWeight?.['claude-opus-5-5']).toBe(1120)
   expect(agg.offset).toBe(SIZE)
@@ -150,76 +147,152 @@ test('扫描日志：按 requestId 去重、统计工具/技能/命令/提问/�
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
-    expect((await ui.find({ type: 'Text', text: /crm-ext.*1 次提问$/ }))?.text).toContain('crm-ext')
-    expect((await ui.find({ type: 'Text', text: /^\$1\.50$/ }))?.text).toBe('$1.50')
-    // 进行中的会话：610 × (1.5 / 1220) = $0.75，标「≈」
-    expect((await ui.find({ type: 'Text', text: /^≈ \$0\.750$/ }))?.text).toBe('≈ $0.750')
-    // 订阅额度放在最上面，超过 80% 的读数可见
-    expect((await ui.find({ type: 'Text', text: /^87%$/ }))?.text).toBe('87%')
-    expect((await ui.find({ type: 'Text', text: /1 小时 30 分后重置/ }))?.text).toContain('后重置')
-    expect((await ui.find({ type: 'Text', text: /等价 API 成本/ }))?.text).toContain('等价 API 成本')
-    // 桌面端每张图都显式带高度（否则内嵌框默认 150px：高图被截、矮图留白）
-    if (surface === 'desktop') {
-      const svgs = await ui.findAll({ type: 'Svg' })
-      expect(svgs.length).toBeGreaterThan(2)
-      expect(svgs.every(s => typeof s.props.height === 'number' && (s.props.height as number) > 0)).toBe(true)
-      // 每日成本图：内容 180 高，框高留了余量，不会被裁
-      expect(svgs.some(s => (s.props.height as number) >= 180 && (s.props.height as number) <= 200)).toBe(true)
-      // 每张图都显式带宽度，否则宿主会放大铺满面板、框高不变而裁掉底部
-      expect(svgs.every(s => typeof s.props.width === 'number' && (s.props.width as number) > 0)).toBe(true)
-      // 「更多」里的排行：一行一项，点一项后会话列表只列用过它的会话，再点取消
-      await ui.press({ key: 'toggle-activity' })
-      expect((await ui.find({ type: 'Text', text: /^tdd$/ }))?.text).toBe('tdd')
-      await ui.press({ key: 'pick-skill-tdd' })
-      expect((await ui.find({ type: 'Text', text: /用过技能「tdd」/ }))?.text).toContain('1 个')
-      expect((await ui.find({ type: 'Text', text: /^✓ tdd$/ }))?.text).toBe('✓ tdd')
-      await ui.press({ key: 'clear-pick' })
-      expect(await ui.find({ type: 'Text', text: /用过技能/ })).toBeUndefined()
-      await ui.press({ key: 'toggle-activity' })
-    }
-    // 账号下拉里有当前账号
+    // 账号下拉在顶部工具栏，任何页签都有
     const select = await ui.find({ type: 'Select' })
     const options = (select?.props.options ?? []) as { label?: string }[]
     expect(options.some(o => o.label === 'a@x.com（当前）')).toBe(true)
-    // 活动明细默认折叠，展开后才有技能排行
+
+    // ---- 总览页签：订阅额度 + 花费；不出现会话与工具 ----
     if (surface === 'terminal') {
-      expect(await ui.find({ type: 'Text', text: /^tdd$/ })).toBeUndefined()
-      await ui.press({ key: 'toggle-activity' })
-      expect((await ui.find({ type: 'Text', text: /^tdd$/ }))?.text).toBe('tdd')
-      await ui.press({ key: 'toggle-activity' })
+      // 重置时间显示为具体时刻（与 Claude 自带用量界面一致）
+      expect((await ui.find({ type: 'Text', text: /\d+:\d{2} 重置 $/ }))?.text).toMatch(/重置 $/)
+      expect((await ui.find({ type: 'Text', text: /^5 小时限额$/ }))?.text).toBe('5 小时限额')
+      expect((await ui.find({ type: 'Text', text: /^已用 87%$/ }))?.text).toBe('已用 87%')
+    } else {
+      // 桌面端整行画成一张图：窗口名、重置时刻与百分比都在图里
+      const quota = (await ui.findAll({ type: 'Svg' })).find(x => String(x.props.alt).startsWith('5 小时限额'))
+      expect(String(quota?.props.alt)).toMatch(/重置 已用 \d+%$/)
+      expect((await ui.findAll({ type: 'Svg' })).some(x => String(x.props.alt).endsWith('已用 87%'))).toBe(true)
     }
+    expect((await ui.find({ type: 'Text', text: /^用量$/ }))?.text).toBe('用量')
+    expect((await ui.find({ type: 'Text', text: /按 API 标价折算/ }))?.text).toContain('不是账单')
+    // 一整页：额度、用量、工具、会话都在同一页，没有页签
+    expect(await ui.find({ type: 'Button', key: 'tab-sessions' })).toBeUndefined()
+    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+    if (surface === 'desktop') {
+      const svgs = await ui.findAll({ type: 'Svg' })
+      // 每张图都显式带宽高（否则内嵌框默认 150px，或宿主放大铺满后裁掉底部）
+      expect(svgs.every(s => typeof s.props.height === 'number' && (s.props.height as number) > 0)).toBe(true)
+      expect(svgs.every(s => typeof s.props.width === 'number' && (s.props.width as number) > 0)).toBe(true)
+      // 用量卡片里的每日 token 折线图 120 高，框高留了余量，不会被裁
+      expect(svgs.some(s => (s.props.height as number) >= 120 && (s.props.height as number) <= 135)).toBe(true)
+      // 额度条画成普通图片，只有每日柱状图（要悬停明细）放进内嵌框
+      const quotaBars = svgs.filter(s => String(s.props.alt).includes('重置'))
+      expect(quotaBars.length).toBeGreaterThan(0)
+      expect(quotaBars.every(s => s.props.isInteractive !== true)).toBe(true)
+      expect(svgs.filter(s => s.props.isInteractive === true).map(s => String(s.props.alt))).toEqual([
+        expect.stringContaining('每日 token'),
+      ])
+    }
+
+    // ---- 工具页签：累计 token 与次数两个环形图 + 图例；点一项筛选会话并跳到会话页签 ----
+    expect((await ui.find({ type: 'Text', text: /^Bash$/ }))?.text).toBe('Bash')
+    expect(await ui.find({ type: 'Button', key: 'tool-sort-avg' })).toBeUndefined()
+    if (surface === 'desktop') {
+      const alts = (await ui.findAll({ type: 'Svg' })).map(s => String(s.props.alt))
+      expect(alts.some(a => a.startsWith('工具累计 token'))).toBe(true)
+      expect(alts.some(a => a.startsWith('工具调用'))).toBe(true)
+    }
+    await ui.press({ key: 'pick-tool-Bash' })
+    expect((await ui.find({ type: 'Text', text: /用过工具「Bash」/ }))?.text).toContain('1 个会话')
+    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+    await ui.press({ key: 'clear-pick' })
+    expect(await ui.find({ type: 'Text', text: /用过工具/ })).toBeUndefined()
+
+    // ---- 会话页签：以项目为主线，默认展开第一个项目 ----
+    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+    expect((await ui.find({ type: 'Text', text: /^‹  crm-ext$/ }))?.text).toBe('‹  crm-ext')
+    // 会话行里不再重复项目名
+    // 第 2 行：账号 · token · 最后一条消息（不再有提问数、上下文百分比；会话行不显示金额）
+    const meta = (await ui.find({ type: 'Text', text: /^.*\d+ token/ }))?.text
+    expect(meta).toBeDefined()
+    expect(meta).not.toContain('crm-ext')
+    expect(await ui.find({ type: 'Text', text: /^\$1\.50$/ })).toBeUndefined()
+    if (surface === 'desktop') {
+      // 会话行不画图片（上下文占用用文字）
+      expect((await ui.findAll({ type: 'Svg' })).some(s => String(s.props.alt).startsWith('当前上下文'))).toBe(false)
+    }
+    // 搜索：不匹配时列表为空，清空后恢复
+    await ui.input({ key: 'session-search', text: '不存在的关键字' })
+    expect((await ui.find({ type: 'Text', text: /没有符合筛选条件的会话/ }))?.text).toBeDefined()
+    await ui.input({ key: 'session-search', text: '' })
+    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+    // 点项目行收起，再点展开
+    await ui.press({ key: 'proj-toggle-crm-ext' })
+    expect(await ui.find({ type: 'Text', text: /测试会话标题/ })).toBeUndefined()
+    expect((await ui.find({ type: 'Text', text: /^›  crm-ext$/ }))?.text).toBe('›  crm-ext')
+    // 按下后按钮会换 key（尾部加 ~），让焦点环离开它
+    await ui.press({ key: 'proj-toggle-crm-ext~' })
+    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+    // 展开后项目头的箭头变成「‹」（点它回到项目列表）
+    expect((await ui.find({ type: 'Text', text: /^‹  crm-ext$/ }))?.text).toBe('‹  crm-ext')
+    // 搜索时只有一个项目有结果：自动展开，即使之前手动收起了也直接看得到会话
+    await ui.press({ key: 'proj-toggle-crm-ext' })
+    expect(await ui.find({ type: 'Text', text: /测试会话标题/ })).toBeUndefined()
+    await ui.input({ key: 'session-search', text: '测试会话' })
+    expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
     await ui.unmount()
   }
 
-  // 宽面板：钱花在哪与每日成本双列并排，环形图与活跃度热力图都画得出来
+  // 宽面板：花费合成一张卡片（总数 → 每天 → 花在哪），构成表可在类型 / 模型间切换
   for (const surface of ['terminal', 'desktop'] as const) {
     const wide = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 120 } })
-    expect((await wide.find({ type: 'Text', text: /^钱花在哪$/ }))?.text).toBe('钱花在哪')
-    expect((await wide.find({ type: 'Text', text: /^每日成本$/ }))?.text).toBe('每日成本')
-    expect((await wide.find({ type: 'Text', text: /近 30 天活跃 1 天/ }))?.text).toContain('活跃 1 天')
+    expect((await wide.find({ type: 'Text', text: /^用量$/ }))?.text).toBe('用量')
+    // 旧的三张卡片与活跃度都不再出现
+    for (const gone of [/^钱花在哪$/, /^每日成本$/, /^花费$/, /^活动$/, /^活跃度$/]) {
+      expect(await wide.find({ type: 'Text', text: gone })).toBeUndefined()
+    }
+    // 主数字下一排小指标：等价成本、会话、提问、缓存命中
+    for (const label of [/^等价 API 成本$/, /^会话$/, /^提问$/, /^缓存命中$/]) {
+      expect(await wide.find({ type: 'Text', text: label })).toBeDefined()
+    }
+    // 默认按类型：缓存读取等四类在表里
+    expect((await wide.find({ type: 'Text', text: /^缓存读取$/ }))?.text).toBe('缓存读取')
+    // 切到按模型：显示友好名，类型表收起
+    await wide.press({ key: 'breakdown-model' })
+    expect((await wide.find({ type: 'Text', text: /^Opus 5\.5$/ }))?.text).toBe('Opus 5.5')
+    expect(await wide.find({ type: 'Text', text: /^缓存读取$/ })).toBeUndefined()
+    await wide.press({ key: 'breakdown-type' })
     if (surface === 'desktop') {
       const svgs = await wide.findAll({ type: 'Svg' })
-      expect(svgs.some(s => s.props.alt === '成本构成')).toBe(true)
-      expect(svgs.some(s => s.props.alt === '活跃度热力图')).toBe(true)
+      // 卡片里只剩每日柱状图，不再有环形图
+      expect(svgs.some(s => s.props.alt === '成本构成')).toBe(false)
       expect(svgs.every(s => typeof s.props.width === 'number' && typeof s.props.height === 'number')).toBe(true)
     }
     await wide.unmount()
   }
 
-  // 双击会话：单击不进入；双击进入它的上下文（非当前会话，从日志还原）；返回回到总览
+  // 窄面板（侧边栏默认宽度）：会话行精简，复制按钮用短标签，不出现双栏
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const narrow = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 40 } })
+    expect((await narrow.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+    // 会话 s1 在 Desktop 里有记录：桌面端标题按钮的提示是「打开」，终端仍是「复制命令」；
+    // 标题就是唯一的主操作，不再有单独的按钮
+    expect(await narrow.find({ type: 'Button', key: 'open-s1' })).toBeDefined()
+    expect((await narrow.find({ type: 'Text', text: surface === 'desktop' ? /打开$/ : /复制命令$/ }))?.text).toBeDefined()
+    expect(await narrow.find({ type: 'Button', text: /^复制恢复命令$/ })).toBeUndefined()
+    expect(await narrow.find({ type: 'Button', text: /^在 Desktop 打开$/ })).toBeUndefined()
+    expect(await narrow.find({ type: 'Text', text: /^最后消息/ })).toBeUndefined()
+    await narrow.unmount()
+  }
+  // 中等宽度：保留完整会话行
+  const medium = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 70 } })
+  expect(await medium.find({ type: 'Button', key: 'open-s1' })).toBeDefined()
+  expect(await medium.find({ type: 'Button', text: /^复制恢复命令$/ })).toBeUndefined()
+  await medium.unmount()
+
+  // 总览里没有返回洞察按钮（那只属于当前会话的实时页）
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'open-s2' })
-  expect(await ui.find({ type: 'Button', text: /返回洞察/ })).toBeUndefined()
-  await ui.press({ key: 'open-s2' })
-  for (let i = 0; i < 2000; i++) await new Promise<void>(r => r())
-  expect(await ui.find({ type: 'Button', text: /返回洞察/ })).toBeDefined()
-  // s2 只有一次请求：上下文 10 + 1000 + 200 = 1210，按 200k 窗口约 0.6%
-  expect((await ui.find({ type: 'Text', text: /^最后上下文/ }))?.text).toBe('最后上下文 0.6%')
-  expect((await ui.find({ type: 'Text', text: /^进行中的会话$/ }))?.text).toBe('进行中的会话')
-  expect((await ui.find({ type: 'Text', text: /1 次请求/ }))?.text).toContain('骤降')
-  await ui.press({ key: 'back' })
   expect(await ui.find({ type: 'Button', text: /返回洞察/ })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: /测试会话标题/ }))?.text).toContain('测试会话标题')
+
+  // 设置页：关掉金额后，用量卡片不再显示等价成本；排除项目后会话页签不再列出它
+  await ui.press({ key: 'open-settings' })
+  expect((await ui.find({ type: 'Text', text: /^插件设置$/ }))?.text).toBe('插件设置')
+  await ui.press({ key: 'set-tg-money' })
+  await ui.press({ key: 'set-tg-proj-crm-ext' })
+  await ui.press({ key: 'open-settings' })
+  expect(await ui.find({ type: 'Text', text: /^等价 API 成本$/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /测试会话标题/ })).toBeUndefined()
   await ui.unmount()
 })

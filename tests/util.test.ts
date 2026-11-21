@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { contextTrendSvg, dailySvg, svgSize } from '../hooks/charts'
-import { mergeSessions, paginate, projectChips, rankIndex, toolKey } from '../hooks/insights'
+import { groupByProject, mergeSessions, rankIndex, shellQuote, toolKey } from '../hooks/insights'
 import { emptyAgg, loadAccounts } from '../hooks/scan'
 import {
   billingWeight,
@@ -13,11 +13,15 @@ import {
   fmtDayAgo,
   fmtTokens,
   fmtUntil,
+  layoutTier,
   paneWidths,
   programOf,
   sameAccountWindows,
   sessionAccount,
   shortFilePath,
+  fmtResetAt,
+  prettyModel,
+  quotaWindowName,
 } from '../hooks/util'
 import type { SessionAgg } from '../types'
 
@@ -54,7 +58,7 @@ function session(id: string, opts: { weight: number; costUsd?: number; isSub?: b
   a.days = {
     '2026-11-20': {
       in: opts.weight, out: 0, cr: 0, cw: 0, cw1h: 0, req: 1, prompts: 1,
-      models: { m: 1 }, modelWeight: { m: opts.weight }, tools: {}, toolTokens: {}, skills: {},
+      models: { m: 1 }, modelWeight: { m: opts.weight }, tools: {}, toolTokens: {},
     },
   }
   return a
@@ -88,7 +92,7 @@ test('当前账号：桌面端登录的账号与 CLI（~/.claude.json）不同�
   const desk = '/h/Library/Application Support/Claude/claude-code-sessions'
   const dir = (name: string) => ({ name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
   const files: Record<string, string> = {
-    [`${desk}/acctA/org/local_1.json`]: '{"cliSessionId":"desk-session"}',
+    [`${desk}/acctA/org/local_1.json`]: '{"cliSessionId":"desk-session","priorCliSessionIds":["old-session"],"title":"侧边栏标题","isArchived":true}',
     [`${desk}/acctB/org/local_1.json`]: '{"cliSessionId":"cli-session"}',
     // CLI 登录的是 B
     '/h/.claude.json': '{"oauthAccount":{"accountUuid":"acctB","emailAddress":"b@x.com"}}',
@@ -111,13 +115,20 @@ test('当前账号：桌面端登录的账号与 CLI（~/.claude.json）不同�
   const a = await loadAccounts($, '/h', 'desk-session')
   expect(a.current).toBe('acctA')
   expect(a.labels.acctB?.email).toBe('b@x.com')
+  // CLI 会话 id → Desktop 会话 id（取自文件里的 sessionId，缺失时用文件名）
+  expect(a.desktopBySession['desk-session']).toBe('local_1')
+  expect(a.desktopBySession['cli-session']).toBe('local_1')
+  // Desktop 标题与归档状态只记在当前日志 id 上；回退前的旧 id 保留它自己的标题
+  expect(a.desktopMeta?.['desk-session']).toEqual({ title: '侧边栏标题', isArchived: true })
+  expect(a.desktopMeta?.['old-session']).toBeUndefined()
+  expect(a.bySession['old-session']).toBe('acctA')
   // 本会话还没被桌面端记录（如纯 CLI 会话）：退回 ~/.claude.json
   expect((await loadAccounts($, '/h', 'unknown')).current).toBe('acctB')
   expect((await loadAccounts($, '/h')).current).toBe('acctB')
 })
 
 test('额度串号：按会话归属取账号；重置时间一致的旧读数视为存错账号并清掉', () => {
-  const acc = { bySession: { s1: 'acctA' }, labels: {}, current: 'acctB' }
+  const acc = { bySession: { s1: 'acctA' }, desktopBySession: {}, labels: {}, current: 'acctB' }
   // 状态里的 current 过期了，会话归属优先
   expect(sessionAccount(acc, 's1')).toBe('acctA')
   expect(sessionAccount(acc, 'other')).toBe('acctB')
@@ -151,7 +162,7 @@ test('paneWidths 与图表下限一致：窄面板与双栏临界点不溢宽', 
   expect(paneWidths(74).half).toBeGreaterThanOrEqual(200)
 })
 
-test('排行：项目与模型按成本、工具按上下文估算 token（副计数保留次数）、技能按次数；未估价项目不进项目排行', () => {
+test('排行：模型按成本、工具按上下文估算 token（副计数保留次数）', () => {
   const [a, b] = mergeSessions([session('a', { weight: 100, costUsd: 1 }), session('b', { weight: 50, costUsd: 0.5 })])
   const [unpriced] = mergeSessions([session('u', { weight: 50 })])
   if (!a || !b || !unpriced) throw new Error('缺少会话')
@@ -178,8 +189,6 @@ test('排行：项目与模型按成本、工具按上下文估算 token（副�
   // 模型按成本排：11-19 当天成本 $0.5，opus 权重占 80%（$0.4）高于 haiku（$0.1，尽管 haiku 请求数 4 > 1）
   expect((r.model.get('opus')?.value ?? 0) > (r.model.get('haiku')?.value ?? 0)).toBe(true)
   expect(r.model.get('haiku')?.subCount).toBe(4)
-  // 未估价会话（dayUsd = 0）不进项目排行，避免抬头项目数与列表不一致
-  expect(r.proj.get('未知项目')?.ids.has('u')).toBe(false)
   // 不在范围内的天不计
   expect(rankIndex([a, b], new Set(['2026-11-18']), false).tool.size).toBe(0)
   expect(toolKey('mcp__srv__x', true)).toBe('srv · x')
@@ -188,28 +197,27 @@ test('排行：项目与模型按成本、工具按上下文估算 token（副�
   expect(fmtDayAgo('2026-11-15', '2026-11-20')).toBe('5 天前')
 })
 
-test('项目分组胶囊与分页：按会话数排序、保留已选中冷门项、页码越界自动钳制', () => {
-  const mk = (project: string, usd: number) => ({ project, r: { usd } })
-  const list = [mk('b', 1), mk('a', 5), mk('b', 2), mk('c', 10), mk('d', 0.1)]
-  // 按会话数降序（b=2），同数按成本降序（c=10 > a=5 > d=0.1）
-  expect(projectChips(list, undefined, 2)).toEqual([
-    { name: 'b', count: 2 },
-    { name: 'c', count: 1 },
-  ])
-  // 已选中项不在前 limit 个中时补在末尾，确保可清除
-  expect(projectChips(list, 'd', 2)).toEqual([
-    { name: 'b', count: 2 },
-    { name: 'c', count: 1 },
-    { name: 'd', count: 1 },
-  ])
-
-  const items = [1, 2, 3, 4, 5, 6, 7, 8]
-  expect(paginate(items, 0, 6)).toEqual({ page: 0, totalPages: 2, slice: [1, 2, 3, 4, 5, 6] })
-  expect(paginate(items, 1, 6)).toEqual({ page: 1, totalPages: 2, slice: [7, 8] })
-  // 越界页码自动收敛到末页 / 首页
-  expect(paginate(items, 99, 6)).toEqual({ page: 1, totalPages: 2, slice: [7, 8] })
-  expect(paginate(items, -3, 6)).toEqual({ page: 0, totalPages: 2, slice: [1, 2, 3, 4, 5, 6] })
-  expect(paginate([], 2, 6)).toEqual({ page: 0, totalPages: 1, slice: [] })
+test('会话按项目分组：组内保持顺序，组序跟随排序方式', () => {
+  const mk = (id: string, project: string, usd: number, lastAt: number, ctx?: number) => ({
+    id,
+    project,
+    lastAt,
+    // token 取成本的 100 倍，c 例外：成本最高但 token 最少
+    r: { usd, in: project === 'c' ? 1 : usd * 100, out: 0, cr: 0, cw: 0 },
+    ctx,
+  })
+  const list = [mk('1', 'b', 1, 50, 150_000), mk('2', 'a', 5, 40), mk('3', 'b', 2, 30), mk('4', 'c', 10, 10, 20_000)]
+  // 按时间：看组内最近活动（b=50 > a=40 > c=10），组内保持传入顺序
+  const byTime = groupByProject(list, 'recent')
+  expect(byTime.map(g => g.name)).toEqual(['b', 'a', 'c'])
+  expect(byTime[0]?.sessions.map(s => s.id)).toEqual(['1', '3'])
+  expect(byTime[0]?.usd).toBe(3)
+  // 按成本：看项目总成本（c=10 > a=5 > b=3）
+  expect(groupByProject(list, 'cost').map(g => g.name)).toEqual(['c', 'a', 'b'])
+  // 按 token：看项目总 token（a=500 > b=300 > c=1）
+  expect(groupByProject(list, 'tokens').map(g => g.name)).toEqual(['a', 'b', 'c'])
+  // 按当前上下文：看组内最高占比（b=75% > c=10% > a 无数据）
+  expect(groupByProject(list, 'context').map(g => g.name)).toEqual(['b', 'c', 'a'])
 })
 
 test('上下文骤降事件、文件活动筛选与路径截短', () => {
@@ -252,4 +260,36 @@ test('按模型计费权重：Opus/Sonnet 5.5 缓存读 0.05×，4.x/Haiku 0.1×
   expect(billingWeight(10, 50, 1000, 200, 0, 'claude-haiku-5-5')).toBe(610)
   // 异常数据 cw1h > cw 时不把 5m 写算成负数
   expect(billingWeight(0, 0, 0, 10, 20, 'claude-opus-5-5')).toBe(40)
+})
+
+test('layoutTier：60 / 84 列为窄、中、宽的分界', () => {
+  expect(layoutTier(40)).toBe('narrow')
+  expect(layoutTier(59)).toBe('narrow')
+  expect(layoutTier(60)).toBe('medium')
+  expect(layoutTier(83)).toBe('medium')
+  expect(layoutTier(84)).toBe('wide')
+  expect(layoutTier(120)).toBe('wide')
+})
+
+test('额度重置时刻：当天只写时刻，一周内带星期，更远写日期', () => {
+  const tz = 480
+  const now = Date.parse('2026-11-21T02:00:00Z') // 北京时间 11-21（周六）10:00
+  expect(fmtResetAt(Date.parse('2026-11-21T10:10:00Z'), now, tz)).toBe('18:10')
+  expect(fmtResetAt(Date.parse('2026-11-23T13:00:00Z'), now, tz)).toBe('周一21:00')
+  expect(fmtResetAt(Date.parse('2026-12-03T13:00:00Z'), now, tz)).toBe('12/3 21:00')
+  expect(quotaWindowName('seven_day')).toBe('每周 · 所有模型')
+})
+
+test('模型友好名', () => {
+  expect(prettyModel('claude-opus-5-5')).toBe('Opus 5.5')
+  expect(prettyModel('claude-fable-5-2')).toBe('Fable 5.2')
+  expect(prettyModel('claude-sonnet-4-20250514')).toBe('Sonnet 4')
+  expect(prettyModel('claude-3-5-sonnet-20241022')).toBe('Sonnet 3.5')
+  expect(prettyModel('unknown')).toBe('unknown')
+})
+
+test('shellQuote：普通路径原样，含空格或单引号的加引号转义', () => {
+  expect(shellQuote('/Users/me/proj')).toBe('/Users/me/proj')
+  expect(shellQuote('/Users/me/my proj')).toBe("'/Users/me/my proj'")
+  expect(shellQuote("/tmp/it's")).toBe("'/tmp/it'\\''s'")
 })

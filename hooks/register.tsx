@@ -11,8 +11,8 @@ import type {
   StepRecord,
 } from '../types'
 import { ACCENT, BLUE, GREY, ORANGE, PALETTE, contextTrendSvg, stackSvg, svgSize } from './charts'
-import { groupTools, renderInsights, renderSessionDetail, startInsights } from './insights'
-import { cancelSessionDetail, runScan } from './scan'
+import { groupTools, renderInsights, startInsights } from './insights'
+import { runScan } from './scan'
 import type { PaneInput } from './insights'
 import {
   getAccounts,
@@ -69,28 +69,17 @@ async function renderMain($: EngineInterface, e: PaneInput): Promise<JSX.Element
   const focus = await getFocus($)
   if (focus === null) return renderInsights($, e)
   const { Box, Button, Text } = $.ui.resolve(e)
+  // 只有当前会话有详情页（实时数据，含窗口构成）；焦点不是当前会话时回到总览
   const currentId = await $.session.id().catch(() => undefined)
-  const isCurrent = focus === currentId
-  // 当前会话：实时数据（含窗口构成）；其他会话：从日志还原
-  const body = isCurrent ? await renderSession($, e) : await renderSessionDetail($, e, focus)
+  if (focus !== currentId) return renderInsights($, e)
+  const body = await renderSession($, e)
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" columnGap={2} paddingX={1} paddingTop={1} alignItems="center">
-        <Button
-          key="back"
-          label="← 返回洞察"
-          plain
-          dimColor
-          onPress={() => {
-            cancelSessionDetail()
-            void setFocus($, () => null)
-          }}
-        />
-        {isCurrent ? (
-          <Text dimColor size="footnote">
-            当前会话 · 实时
-          </Text>
-        ) : null}
+        <Button key="back" label="← 返回洞察" plain dimColor onPress={() => void setFocus($, () => null)} />
+        <Text dimColor size="footnote">
+          当前会话 · 实时
+        </Text>
       </Box>
       {body}
     </Box>
@@ -291,7 +280,7 @@ export const register: Register = on => {
     return ran
   })
 
-  // 「上下文洞察」面板：默认总览，双击会话进入它的上下文（匹配器用字面量供校验器静态识别）
+  // 「上下文洞察」面板：默认总览；`/ctx-insights full` 进入当前会话的上下文（匹配器用字面量供校验器静态识别）
   on('ui.render', { component: 'Pane', requestId: 'cc-context-insights' }, async ($, e) => renderMain($, e))
 }
 
@@ -313,7 +302,9 @@ async function renderSession($: EngineInterface, e: PaneInput): Promise<JSX.Elem
           alt={p.alt}
           width={size.width}
           height={Math.ceil(size.height * 1.04) + 2}
-          isInteractive
+          // 只有需要悬停提示的图才放进沙盒内嵌框；其余画成普通图片。
+          // 内嵌框会抢滚轮事件、各自重排，列表里一多（会话圆环、额度条）滚动就会严重抖动
+          isInteractive={p.isInteractive === true ? true : undefined}
         />
       )
     }

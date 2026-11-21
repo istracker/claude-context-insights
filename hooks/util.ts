@@ -142,10 +142,11 @@ export function cardStyle(surface: string) {
   if (surface === 'terminal') return CARD
   return {
     borderStyle: 'round',
-    borderColor: 'rgba(127,127,127,0.32)',
-    backgroundColor: 'rgba(127,127,127,0.10)',
+    // 克制：更淡的描边与底色，靠留白而不是框线区分区块
+    borderColor: 'rgba(127,127,127,0.20)',
+    backgroundColor: 'rgba(127,127,127,0.05)',
     paddingX: 'md',
-    paddingY: 'sm',
+    paddingY: 'md',
   } as const
 }
 /** 卡片的边框加左右内边距大约占掉的像素，图表要比面板窄这么多 */
@@ -162,8 +163,16 @@ export function paneWidths(bodyColumns: number): { full: number; half: number } 
   const body = Math.round(bodyColumns * pxPerCol) - 24
   const full = Math.max(240, body - CARD_INSET)
   // 两栏并排（每栏卡片至少 200px 图表 + 40px 边框内边距，加上栏间距 32px，共需 ~512px ≈ 74 列）
-  const half = bodyColumns >= 74 ? Math.floor((body - 32) / 2) - CARD_INSET : full
+  const half = bodyColumns >= 74 ? Math.floor((body - 32) / 2) - CARD_INSET - 16 : full
   return { full, half }
+}
+
+/** 面板宽度档位：窄（侧边栏默认）<60 列，中 60–83 列，宽 ≥84 列 */
+export type LayoutTier = 'narrow' | 'medium' | 'wide'
+export const NARROW_COLS = 60
+export const WIDE_COLS = 84
+export function layoutTier(bodyColumns: number): LayoutTier {
+  return bodyColumns < NARROW_COLS ? 'narrow' : bodyColumns >= WIDE_COLS ? 'wide' : 'medium'
 }
 
 /** 订阅额度窗口的中文名 */
@@ -176,6 +185,42 @@ export function windowLabel(kind: string): string {
     spend_limit: '消费上限',
   }
   return names[kind] ?? kind
+}
+
+/** 订阅额度面板里的窗口名，与 Claude 自带的用量界面一致 */
+export function quotaWindowName(kind: string): string {
+  const names: Record<string, string> = {
+    five_hour: '5 小时限额',
+    seven_day: '每周 · 所有模型',
+    seven_day_opus: '每周 · Opus',
+    seven_day_sonnet: '每周 · Sonnet',
+    spend_limit: '消费上限',
+  }
+  return names[kind] ?? kind
+}
+
+const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
+/** 重置时刻：今天「6:10」，一周内「周一21:00」，更远「12/3 21:00」 */
+export function fmtResetAt(ts: number, now: number, tzMin: number): string {
+  const d = new Date(ts + tzMin * 60_000)
+  if (Number.isNaN(d.getTime())) return '—'
+  const hm = `${d.getUTCHours()}:${String(d.getUTCMinutes()).padStart(2, '0')}`
+  const day = (t: number) => Math.floor((t + tzMin * 60_000) / 86_400_000)
+  const diff = day(ts) - day(now)
+  if (diff <= 0) return hm
+  if (diff < 7) return `${WEEKDAYS[d.getUTCDay()]}${hm.padStart(5, '0')}`
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${hm.padStart(5, '0')}`
+}
+
+/** 模型的友好名：claude-opus-5-5 → Opus 5.5，claude-3-5-sonnet-… → Sonnet 3.5；认不出就原样返回 */
+export function prettyModel(id: string): string {
+  const cap = (w: string) => w.charAt(0).toUpperCase() + w.slice(1)
+  const a = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(?:\[1m\])?$/.exec(id)
+  if (a?.[1] && a[2]) return `${cap(a[1])} ${a[2]}${a[3] ? `.${a[3]}` : ''}`
+  const b = /^claude-(\d+)(?:-(\d{1,2}))?-([a-z]+)/.exec(id)
+  if (b?.[1] && b[3]) return `${cap(b[3])} ${b[1]}${b[2] ? `.${b[2]}` : ''}`
+  return id
 }
 
 /** 距某时刻还有多久：「2 小时 10 分」「3 天」 */

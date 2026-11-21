@@ -7,12 +7,12 @@ import type { EngineInterface } from 'claude-code'
 import type {
   AccountMap,
   Activity,
+  InsightSettings,
   InsightView,
   RateSnapshot,
   RateWindow,
   ScanState,
   SessionAgg,
-  SessionDetail,
   Snapshot,
   StepRecord,
   StepTotals,
@@ -25,7 +25,7 @@ export const COMMAND = 'ctx-insights'
 export const MAX_STEPS = 300
 /** 额度快照跨会话保存（$.state 只活在本会话），切换账号后另一个账号的最后读数仍可显示 */
 export const LIMITS_STORE_KEY = 'limits-1'
-export const NO_ACCOUNTS: AccountMap = { bySession: {}, labels: {} }
+export const NO_ACCOUNTS: AccountMap = { bySession: {}, desktopBySession: {}, labels: {} }
 export const IDLE_SCAN: ScanState = { isRunning: false, doneFiles: 0, totalFiles: 0, doneBytes: 0, totalBytes: 0 }
 
 // 字段变了就改 shape：旧版本存下的值会被丢弃，而不是读成错的形状
@@ -59,14 +59,16 @@ const busyAtom = atom({ plugin: 'cc-context-insights', key: 'busy' } as const, f
 const sessionsAtom = atom({ plugin: 'cc-context-insights', key: 'sessions' } as const, [] as SessionAgg[], {
   shape: 'sessions-5',
 })
-const installedSkillsAtom = atom({ plugin: 'cc-context-insights', key: 'installed-skills' } as const, [] as string[], {
-  shape: 'installed-skills-1',
-})
 const scanAtom = atom({ plugin: 'cc-context-insights', key: 'scan' } as const, IDLE_SCAN, { shape: 'scan-1' })
 const DEFAULT_VIEW: InsightView = { range: '7d', sort: 'recent' }
+/** 设置跨会话保存在 $.store；本会话状态里放一份，修改后面板立即重绘 */
+export const SETTINGS_STORE_KEY = 'settings-1'
+const settingsAtom = atom({ plugin: 'cc-context-insights', key: 'settings' } as const, {} as InsightSettings, {
+  shape: 'settings-1',
+})
 const viewAtom = atom({ plugin: 'cc-context-insights', key: 'view' } as const, DEFAULT_VIEW, { shape: 'view-2' })
 const accountsAtom = atom({ plugin: 'cc-context-insights', key: 'accounts' } as const, NO_ACCOUNTS, {
-  shape: 'accounts-1',
+  shape: 'accounts-3',
 })
 const limitsAtom = atom({ plugin: 'cc-context-insights', key: 'limits' } as const, {} as Record<string, RateSnapshot>, {
   shape: 'limits-1',
@@ -74,12 +76,9 @@ const limitsAtom = atom({ plugin: 'cc-context-insights', key: 'limits' } as cons
 const liveLimitsAtom = atom({ plugin: 'cc-context-insights', key: 'live-limits' } as const, null as RateSnapshot | null, {
   shape: 'live-limits-1',
 })
-// 面板默认是洞察总览；在会话列表里双击某个会话，就切到那个会话的上下文（focus = 会话 id）
+// 面板默认是洞察总览；`/ctx-insights full` 切到当前会话的上下文（focus = 会话 id）
 const focusAtom = atom({ plugin: 'cc-context-insights', key: 'focus' } as const, null as string | null, {
   shape: 'focus-1',
-})
-const detailAtom = atom({ plugin: 'cc-context-insights', key: 'detail' } as const, null as SessionDetail | null, {
-  shape: 'detail-2',
 })
 
 export function getSteps($: EngineInterface) {
@@ -145,6 +144,21 @@ export function setViewState($: EngineInterface, fn: (v: InsightView) => Insight
   return update($, viewAtom, fn)
 }
 
+export function getSettings($: EngineInterface) {
+  return read($, settingsAtom)
+}
+/** 改设置：写本会话状态（触发重绘）并持久化到 $.store */
+export async function setSettings($: EngineInterface, fn: (v: InsightSettings) => InsightSettings) {
+  let next: InsightSettings = {}
+  await update($, settingsAtom, v => (next = fn(v)))
+  await $.store.set(SETTINGS_STORE_KEY, next)
+}
+/** 会话开始时从 $.store 载入设置 */
+export async function loadSettings($: EngineInterface) {
+  const stored = (await $.store.get(SETTINGS_STORE_KEY)) as InsightSettings | undefined
+  if (stored && typeof stored === 'object') await update($, settingsAtom, () => stored)
+}
+
 export function getAccounts($: EngineInterface) {
   return read($, accountsAtom)
 }
@@ -166,20 +180,6 @@ export function setFocus($: EngineInterface, fn: (v: string | null) => string | 
   return update($, focusAtom, fn)
 }
 
-export function getDetail($: EngineInterface) {
-  return read($, detailAtom)
-}
-export function setDetail($: EngineInterface, fn: (v: SessionDetail | null) => SessionDetail | null) {
-  return update($, detailAtom, fn)
-}
-
-export function getInstalledSkills($: EngineInterface) {
-  return read($, installedSkillsAtom)
-}
-export function setInstalledSkills($: EngineInterface, fn: (v: string[]) => string[]) {
-  return update($, installedSkillsAtom, fn)
-}
-
 // ---------- 实时订阅额度短期缓存（存在本会话状态中，避免总览每次渲染重复调 $.session.usage()） ----------
 
 const LIVE_LIMITS_TTL = 15_000
@@ -188,15 +188,23 @@ export async function noteLiveLimits($: EngineInterface, windows: RateWindow[], 
   await update($, liveLimitsAtom, () => ({ at, windows })).catch(() => undefined)
 }
 
+/** 模块内缓存：绘制时不允许写状态（写入会被拒绝），所以绘制里取到的读数存在这里，避免每次滚动都调一次 usage() */
+let liveMemo: { at: number; windows: RateWindow[] } | undefined
+
 export async function readLiveLimits($: EngineInterface, now: number): Promise<RateWindow[]> {
+  if (liveMemo && Math.abs(now - liveMemo.at) < LIVE_LIMITS_TTL) return liveMemo.windows
   const hit = await read($, liveLimitsAtom)
-  if (hit && Math.abs(now - hit.at) < LIVE_LIMITS_TTL) return hit.windows
+  if (hit && Math.abs(now - hit.at) < LIVE_LIMITS_TTL) {
+    liveMemo = hit
+    return hit.windows
+  }
   const live = await $.session.usage().catch(() => undefined)
   const windows: RateWindow[] = (live?.rateLimits ?? []).map(r => ({
     kind: r.kind,
     percentUsed: r.percentUsed,
     resetsAt: r.resetsAt,
   }))
+  liveMemo = { at: now, windows }
   await update($, liveLimitsAtom, () => ({ at: now, windows })).catch(() => undefined)
   return windows
 }

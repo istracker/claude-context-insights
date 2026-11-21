@@ -4,29 +4,31 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 import type {
   AccountMap,
   DayAgg,
-  FileFilter,
   InsightRange,
+  Breakdown,
   InsightSort,
+  InsightSettings,
+  InsightTab,
   InsightView,
   RankKind,
   RateSnapshot,
   RateWindow,
   SessionAgg,
 } from '../types'
-import { dayKey, loadSessionDetail, runScan } from './scan'
+import { dayKey, runScan } from './scan'
 import {
   COMMAND,
   getAccounts,
-  getDetail,
-  getInstalledSkills,
   getLimits,
   getScan,
   getSessions,
+  getSettings,
+  loadSettings,
   getView,
   LIMITS_STORE_KEY,
   readLiveLimits,
-  setFocus,
   setLimits,
+  setSettings,
   setViewState,
 } from './state'
 import {
@@ -37,58 +39,34 @@ import {
   ORANGE,
   PALETTE,
   TEAL,
-  contextTrendSvg,
-  dailyAverage,
-  dailySvg,
+  dailyTokenSvg,
   donutSvg,
-  heatmapSvg,
-  lineSvg,
-  stackSvg,
+  dualBarSvg,
+  quotaSvg,
   svgSize,
+  thinStackSvg,
 } from './charts'
-import type { DayPoint, HeatDay } from './charts'
+import type { DayPoint } from './charts'
 import {
   addCount,
   cacheReadFactor,
   cardStyle,
-  filterFiles,
   fmtAgo,
-  fmtClockTime,
-  fmtDayAgo,
   fmtTokens,
-  fmtUntil,
+  fmtResetAt,
+  quotaWindowName,
   fmtUsd,
+  layoutTier,
   paneWidths,
   pct,
+  prettyModel,
   sameAccountWindows,
   sessionAccount,
-  shortFilePath,
   sparkline,
   textBar,
   topEntries,
-  windowLabel,
 } from './util'
 
-// ---------- 双击会话 ----------
-// 按钮事件不带点击次数，自己判断：同一会话在 DOUBLE_MS 内按两次算双击
-const DOUBLE_MS = 450
-let lastPress: { id: string; at: number } | undefined
-/** 已为哪个会话发起过加载，避免渲染时重复发起 */
-let requestedDetail: string | undefined
-
-async function pressSession($: EngineInterface, id: string, file: string | undefined): Promise<void> {
-  const now = await $.clock.now()
-  const isDouble = lastPress !== undefined && lastPress.id === id && now - lastPress.at <= DOUBLE_MS
-  lastPress = isDouble ? undefined : { id, at: now }
-  if (!isDouble) return
-  await setViewState($, v => ({ ...v, fileFilter: undefined, showAllFiles: false }))
-  await setFocus($, () => id)
-  const current = await $.session.id().catch(() => undefined)
-  if (id !== current && file) {
-    requestedDetail = id
-    void loadSessionDetail($, id, file)
-  }
-}
 /** 「上下文」面板里渲染函数的输入 */
 export type PaneInput = RenderInput<'Pane'>
 const DAY_MS = 86_400_000
@@ -144,6 +122,55 @@ export type MergedSession = {
   /** 每一天分到的成本 */
   dayUsd: Record<string, number>
   account?: string
+  /** 会话所在项目目录（终端恢复命令要先 cd 过去） */
+  cwd?: string
+  /** 当前上下文大小：最后一次请求的输入 + 缓存读 + 缓存写 */
+  ctx?: number
+  /** 用户最后一次提问（截断） */
+  lastPrompt?: string
+  /** 标题是不是用户自己起的（否则标题就是最后一次提问，不重复显示） */
+  hasTitle: boolean
+}
+
+/**
+ * 在 Claude Desktop 里打开会话：面板里的 Link 点了没有反应（内嵌页面不处理 claude:// 协议），
+ * 所以交给系统的 open 去打开链接；失败（没有 open、被拒绝）就退回复制链接
+ */
+async function openInDesktop(
+  $: EngineInterface,
+  url: string,
+  surface: PaneInput['surface'],
+  isArchived = false,
+): Promise<void> {
+  const r = await $.process.run(['open', url], { timeoutMs: 5000 }).catch(() => undefined)
+  if (r?.exitCode === 0) {
+    $.ui.toast(isArchived ? '已发出打开请求。该会话已归档，若没打开，请先在 Desktop 里取消归档' : '已在 Desktop 打开', {
+      timeoutMs: isArchived ? 6000 : 3000,
+    })
+    return
+  }
+  await $.ui.copy({ text: url, surface })
+  $.ui.toast('打开失败，已复制链接，可粘贴到浏览器地址栏', { timeoutMs: 6000 })
+}
+
+/** 不换行空格：占位用，让空文本行也保有一行高度 */
+const NBSP = '\u00A0'
+
+/** 给 shell 用的单引号转义 */
+export function shellQuote(v: string): string {
+  return /^[\w@%+=:,./-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`
+}
+
+/** 上下文窗口：超过 200k 的必是 1M 窗口，其余按 200k 算 */
+export function ctxWindowOf(ctx: number): number {
+  return ctx > 200_000 ? 1_000_000 : 200_000
+}
+
+/** 会话搜索：标题、项目、最后一次提问里包含关键字（不分大小写） */
+export function matchSession(s: { title: string; project: string; lastPrompt?: string }, query: string | undefined): boolean {
+  const q = query?.trim().toLowerCase()
+  if (!q) return true
+  return [s.title, s.project, s.lastPrompt ?? ''].some(t => t.toLowerCase().includes(q))
 }
 
 function mergeMap(a: Record<string, number>, b: Record<string, number>): Record<string, number> {
@@ -164,7 +191,6 @@ function mergeDay(a: DayAgg | undefined, b: DayAgg): DayAgg {
       modelWeight: b.modelWeight ? { ...b.modelWeight } : {},
       tools: { ...b.tools },
       toolTokens: b.toolTokens ? { ...b.toolTokens } : {},
-      skills: { ...b.skills },
     }
   }
   return {
@@ -179,7 +205,6 @@ function mergeDay(a: DayAgg | undefined, b: DayAgg): DayAgg {
     modelWeight: mergeMap(a.modelWeight ?? {}, b.modelWeight ?? {}),
     tools: mergeMap(a.tools, b.tools),
     toolTokens: mergeMap(a.toolTokens ?? {}, b.toolTokens ?? {}),
-    skills: mergeMap(a.skills, b.skills),
   }
 }
 
@@ -263,11 +288,15 @@ export function mergeSessions(aggs: SessionAgg[]): MergedSession[] {
       id,
       title: main.title ?? main.lastPrompt ?? id.slice(0, 8),
       project: cwd ? (cwd.split(/[/\\]/).filter(Boolean).slice(-1)[0] ?? cwd) : '未知项目',
+      cwd,
       lastAt,
       costUsd: cost,
       isEstimated,
       days,
       dayUsd,
+      ctx: main.isSub ? undefined : main.lastCtx,
+      lastPrompt: main.lastPrompt,
+      hasTitle: main.title !== undefined,
     })
   }
   return out
@@ -303,7 +332,6 @@ export type Totals = {
   models: Record<string, number>
   tools: Record<string, number>
   toolTokens: Record<string, number>
-  skills: Record<string, number>
 }
 
 export function emptyTotals(): Totals {
@@ -319,7 +347,6 @@ export function emptyTotals(): Totals {
     models: {},
     tools: {},
     toolTokens: {},
-    skills: {},
   }
 }
 
@@ -348,7 +375,6 @@ export function addSession(t: Totals, s: MergedSession, days: Set<string> | unde
     mergeMapInPlace(t.models, d.models)
     mergeMapInPlace(t.tools, d.tools)
     mergeMapInPlace(t.toolTokens, d.toolTokens ?? {})
-    mergeMapInPlace(t.skills, d.skills)
   }
   return own
 }
@@ -381,10 +407,10 @@ export function toolKey(name: string, expandMcp: boolean): string {
 }
 
 /** 排行的一项：主排序值（成本 / 估算 token / 次数）、副计数（请求数 / 调用次数）、最近日期（YYYY-MM-DD）、用过它的会话 */
-export type RankItem = { value: number; subCount: number; lastDay: string; ids: Set<string> }
+export type RankItem = { value: number; subCount: number; tokens: number; lastDay: string; ids: Set<string> }
 
 /**
- * 把会话在这段时间里的项目（按成本）、模型（按成本）、工具（按上下文估算 token）、技能（按次数）汇总成 2×2 决策排行。
+ * 把会话在这段时间里的模型（按成本）、工具（按上下文估算 token）汇总成决策排行。
  */
 export function rankIndex(
   sessions: MergedSession[],
@@ -392,15 +418,14 @@ export function rankIndex(
   expandMcp: boolean,
 ): Record<RankKind, Map<string, RankItem>> {
   const out: Record<RankKind, Map<string, RankItem>> = {
-    proj: new Map(),
     model: new Map(),
     tool: new Map(),
-    skill: new Map(),
   }
-  const add = (kind: RankKind, key: string, value: number, subCount: number, day: string, id: string) => {
-    const it = out[kind].get(key) ?? { value: 0, subCount: 0, lastDay: '', ids: new Set<string>() }
+  const add = (kind: RankKind, key: string, value: number, subCount: number, tokens: number, day: string, id: string) => {
+    const it = out[kind].get(key) ?? { value: 0, subCount: 0, tokens: 0, lastDay: '', ids: new Set<string>() }
     it.value += value
     it.subCount += subCount
+    it.tokens += tokens
     if (day > it.lastDay) it.lastDay = day
     it.ids.add(id)
     out[kind].set(key, it)
@@ -408,11 +433,8 @@ export function rankIndex(
   for (const s of sessions) {
     for (const [k, d] of Object.entries(s.days)) {
       if (days && !days.has(k)) continue
-      // 1. 项目按成本排行：只有产生费用的才计入，避免抬头项目数与列表「暂无」不一致
       const usd = s.dayUsd[k] ?? 0
-      if (usd > 0) add('proj', s.project, usd, d.req, k, s.id)
-
-      // 2. 模型按成本排行：按当天各模型的计费权重（无权重时退回请求数占比）分摊当天成本
+      // 1. 模型按成本排行：按当天各模型的计费权重（无权重时退回请求数占比）分摊当天成本
       const mwMap = d.modelWeight ?? {}
       const sumMw = Object.values(mwMap).reduce((a, b) => a + b, 0)
       const sumReq = Object.values(d.models).reduce((a, b) => a + b, 0)
@@ -422,96 +444,61 @@ export function rankIndex(
         const share = sumMw > 0 ? mw / sumMw : sumReq > 0 ? reqs / sumReq : 0
         const mUsd = usd * share
         // 若整个会话未估价（usd=0），退回用请求数作为微弱正值，保证已用模型仍可见
-        add('model', m, mUsd > 0 ? mUsd : reqs * 1e-9, reqs, k, s.id)
+        // token 没有按模型记录，按同一份份额从当天 token 里分摊
+        add('model', m, mUsd > 0 ? mUsd : reqs * 1e-9, reqs, tokensOf(d) * share, k, s.id)
       }
 
-      // 3. 工具按往上下文塞入的估算 token 排行（副计数保留调用次数）
+      // 2. 工具按往上下文塞入的估算 token 排行（副计数保留调用次数）
       const tokMap = d.toolTokens ?? {}
       for (const [name, calls] of Object.entries(d.tools)) {
         if (calls <= 0) continue
         const tok = tokMap[name] ?? calls
-        add('tool', toolKey(name, expandMcp), tok, calls, k, s.id)
+        add('tool', toolKey(name, expandMcp), tok, calls, tok, k, s.id)
       }
-
-      // 4. 技能按调用次数排行
-      for (const [name, n] of Object.entries(d.skills)) if (n > 0) add('skill', name, n, n, k, s.id)
     }
   }
   return out
 }
 
-/** 会话列表按项目分组胶囊：按会话数降序（同数按成本降序），取前 limit 个；若已选中项不在前 limit 个中则补上 */
-export function projectChips(
-  sessions: { project: string; r: { usd: number } }[],
-  selected?: string,
-  limit = 8,
-): { name: string; count: number }[] {
-  const byProj = new Map<string, { count: number; usd: number }>()
-  for (const s of sessions) {
-    const cur = byProj.get(s.project) ?? { count: 0, usd: 0 }
-    cur.count += 1
-    cur.usd += s.r.usd
-    byProj.set(s.project, cur)
-  }
-  const ranked = [...byProj.entries()]
-    .sort((a, b) => b[1].count - a[1].count || b[1].usd - a[1].usd || a[0].localeCompare(b[0]))
-    .map(([name, v]) => ({ name, count: v.count }))
-  const top = ranked.slice(0, limit)
-  if (selected !== undefined && !top.some(p => p.name === selected)) {
-    const hit = ranked.find(p => p.name === selected) ?? { name: selected, count: 0 }
-    top.push(hit)
-  }
-  return top
-}
+/** 按项目分组后的一组会话 */
+export type ProjectGroup<T> = { name: string; sessions: T[]; usd: number; tokens: number; lastAt: number; ctxShare: number }
 
-/** 轻量分页：自动把页码钳在合法范围，避免筛选或扫描后越界 */
-export function paginate<T>(items: T[], rawPage: number | undefined, pageSize: number): {
-  page: number
-  totalPages: number
-  slice: T[]
-} {
-  const totalPages = Math.max(1, Math.ceil(items.length / pageSize))
-  const page = Math.max(0, Math.min(rawPage ?? 0, totalPages - 1))
-  return { page, totalPages, slice: items.slice(page * pageSize, (page + 1) * pageSize) }
-}
-
-/** 汇总所有按天活跃度（用于日历热力图）并计算近 30 天活跃天数与当前连续活跃天数 */
-export function buildHeatMap(
-  sessions: MergedSession[],
-  today: string,
-): { byDay: Record<string, HeatDay>; active30: number; streak: number } {
-  const byDay: Record<string, HeatDay> = {}
+/**
+ * 把（已排好序、已过滤的）会话按项目分组。组内保持传入顺序；
+ * 组的顺序跟随排序方式：按 token 看项目总 token，按当前上下文看组内最高占比，按时间看最近活动（旧的「按成本」仍按总成本）。
+ */
+export function groupByProject<
+  T extends { project: string; lastAt: number; r: { usd: number; in: number; out: number; cr: number; cw: number }; ctx?: number },
+>(
+  sessions: T[],
+  sort: InsightSort,
+): ProjectGroup<T>[] {
+  const map = new Map<string, ProjectGroup<T>>()
   for (const s of sessions) {
-    for (const [k, d] of Object.entries(s.days)) {
-      const tok = tokensOf(d)
-      if (tok <= 0 && d.req <= 0) continue
-      const cur = byDay[k] ?? { usd: 0, tokens: 0, sessions: 0 }
-      cur.usd += s.dayUsd[k] ?? 0
-      cur.tokens += tok
-      cur.sessions += 1
-      byDay[k] = cur
-    }
+    const g = map.get(s.project) ?? { name: s.project, sessions: [], usd: 0, tokens: 0, lastAt: 0, ctxShare: -1 }
+    g.sessions.push(s)
+    g.usd += s.r.usd
+    g.tokens += tokensOf(s.r)
+    g.lastAt = Math.max(g.lastAt, s.lastAt)
+    if (s.ctx !== undefined) g.ctxShare = Math.max(g.ctxShare, s.ctx / ctxWindowOf(s.ctx))
+    map.set(s.project, g)
   }
-  const todayMs = Date.parse(today + 'T00:00:00Z')
-  if (Number.isNaN(todayMs)) return { byDay, active30: 0, streak: 0 }
-  const keyAt = (ago: number) => new Date(todayMs - ago * DAY_MS).toISOString().slice(0, 10)
-  let active30 = 0
-  for (let i = 0; i < 30; i++) if ((byDay[keyAt(i)]?.tokens ?? 0) > 0) active30 += 1
-  // 连续活跃：今天有活动就从今天往前数，今天还没活动就从昨天往前数
-  let streak = 0
-  const startAgo = (byDay[keyAt(0)]?.tokens ?? 0) > 0 ? 0 : 1
-  for (let i = startAgo; i < 365; i++) {
-    if ((byDay[keyAt(i)]?.tokens ?? 0) > 0) streak += 1
-    else break
-  }
-  return { byDay, active30, streak }
+  return [...map.values()].sort((a, b) =>
+    sort === 'tokens'
+      ? b.tokens - a.tokens || b.lastAt - a.lastAt
+      : sort === 'cost'
+        ? b.usd - a.usd || b.lastAt - a.lastAt
+        : sort === 'context'
+        ? b.ctxShare - a.ctxShare || b.lastAt - a.lastAt
+        : b.lastAt - a.lastAt,
+  )
 }
 
 /** 账号显示名：邮箱，没见过就用 id 前 4 位 */
 export function accountLabel(acc: AccountMap, id: string | undefined): string {
   if (id === undefined) return '未归属'
   const l = acc.labels[id]
-  const base = l?.email ?? l?.name ?? `账号 ${id.slice(0, 4)}`
+  const base = l?.alias ?? l?.email ?? l?.name ?? `账号 ${id.slice(0, 4)}`
   return id === acc.current ? `${base}（当前）` : base
 }
 
@@ -519,28 +506,21 @@ export function accountLabel(acc: AccountMap, id: string | undefined): string {
 
 const RANGES: [InsightRange, string][] = [
   ['today', '今天'],
-  ['7d', '7 天'],
-  ['30d', '30 天'],
-  ['all', '全部'],
+  ['7d', '近 7 天'],
+  ['30d', '近 30 天'],
 ]
+/** 卡片右上角的时间范围说明 */
+const RANGE_TITLE: Record<InsightRange, string> = { today: '今天', '7d': '近 7 天', '30d': '近 30 天', all: '全部' }
 const PREV_TITLE: Record<InsightRange, string> = { today: '昨天', '7d': '前 7 天', '30d': '前 30 天', all: '' }
 const SORTS: [InsightSort, string][] = [
   ['recent', '按时间'],
-  ['cost', '按成本'],
+  ['tokens', '按 token'],
 ]
-/** 每类成本是什么，只给占比最高的一类显示 */
-const PART_HINT: Record<Part, string> = {
-  cw: '上下文变化后要重新写入缓存，单价是输入的 1.25～2 倍',
-  out: '模型生成的回复与工具调用参数，单价最高',
-  cr: '复用已缓存的上下文，单价仅为输入的 1/20～1/10',
-  in: '没有命中缓存的输入',
-}
 const ACCOUNT_COLORS = PALETTE
-/** 排行：默认显示几行、展开后最多几行 */
-const RANK_VISIBLE = 6
-const RANK_MAX = 20
 /** 排行点选的对象在会话筛选提示里怎么称呼 */
-const RANK_NOUN: Record<RankKind, string> = { proj: '项目', model: '模型', tool: '工具', skill: '技能' }
+const RANK_NOUN: Record<RankKind, string> = { model: '模型', tool: '工具' }
+/** 设置页最多列出多少个项目（最近活跃的在前，已排除的总会列出） */
+const SETTINGS_PROJECTS = 12
 
 // ---------- 注册 ----------
 
@@ -554,15 +534,24 @@ export async function startInsights($: EngineInterface): Promise<void> {
   const stored = (await $.store.get(LIMITS_STORE_KEY)) as Record<string, RateSnapshot> | undefined
   // 与 refresh 并发：已有的（更新的）读数优先，旧读数只补缺
   if (stored && typeof stored === 'object') await setLimits($, cur => ({ ...stored, ...cur }))
+  // 插件设置跨会话保存在 $.store
+  await loadSettings($)
   void runScan($)
 }
 
 // /ctx-insights 的处理在 register.tsx（要调用本会话的精确统计）
 
 /** 「洞察」标签页的内容：所有会话的额度、成本、会话与活动 */
+/**
+ * 上一次绘制的结果与它的输入签名。面板每滚动一下宿主都会带着新的滚动位置重新调用绘制，
+ * 而滚动不改变任何要画的内容：签名不变时直接返回上次的树，不再重算 55 个会话的合并、分组与排序
+ * （之前每次滚动都整页重算，展开的项目越多越慢，滚动就越抖）。
+ */
+let insightsMemo: { sig: string; tree: JSX.Element } | undefined
+
 export async function renderInsights($: EngineInterface, e: PaneInput): Promise<JSX.Element> {
     const els = $.ui.resolve(e)
-    const { Box, Text, Button, Select } = els
+    const { Box, Text, Button, Select, Input } = els
     // 终端的元素表里也有 Svg，但画不出来：按绘制端判断，终端用文字兜底
     const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
     const card = cardStyle(e.surface)
@@ -578,29 +567,61 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           alt={p.alt}
           width={size.width}
           height={p.viewHeight ?? Math.ceil(size.height * 1.04) + 2}
-          isInteractive
+          // 只有需要悬停提示的图才放进沙盒内嵌框；其余画成普通图片。
+          // 内嵌框会抢滚轮事件、各自重排，列表里一多（会话圆环、额度条）滚动就会严重抖动
+          isInteractive={p.isInteractive === true ? true : undefined}
         />
       )
     }
     const aggs = await getSessions($)
     const scan = await getScan($)
     const view = await getView($)
+    const settings: InsightSettings = await getSettings($)
+    const showMoney = settings.showMoney !== false
     const storedAccounts = await getAccounts($)
-    const installedSkills = await getInstalledSkills($)
     const currentSessionId = await $.session.id().catch(() => undefined)
     // 「当前」以本会话的归属为准（状态里的 current 可能是重新加载插件前算的）
+    // 设置里的显示名覆盖邮箱
+    const labels = { ...storedAccounts.labels }
+    for (const [id, name] of Object.entries(settings.aliases ?? {})) {
+      if (name.trim()) labels[id] = { ...labels[id], alias: name.trim() }
+    }
     const accounts: AccountMap = {
       ...storedAccounts,
+      labels,
       current: sessionAccount(storedAccounts, currentSessionId),
     }
     const now = await $.clock.now()
+    // 绘制签名：只含会改变画面的输入（数据、视图设置、面板宽度、额度读数、时间按 30 秒取整），不含滚动位置
+    const sigParts = [
+      e.surface,
+      e.props.bodyColumns,
+      e.props.placement,
+      view,
+      settings,
+      scan,
+      aggs.length,
+      aggs.reduce((a, x) => a + x.offset + (x.lastAt ?? 0), 0),
+      storedAccounts,
+      currentSessionId,
+      await getLimits($),
+      await readLiveLimits($, now),
+      Math.floor(now / 30_000),
+    ].map(x => JSON.stringify(x) ?? '')
+    const sig = sigParts.join('|')
+    if (insightsMemo?.sig === sig) return insightsMemo.tree
     const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
-    const today = dayKey(now, tzMin)
     const setView = (fn: (v: InsightView) => InsightView) => void setViewState($, fn)
-    const { full, half } = paneWidths(e.props.bodyColumns)
+    const { full } = paneWidths(e.props.bodyColumns)
 
     // ----- 数据 -----
-    const all = mergeSessions(aggs).map(s => ({ ...s, account: accounts.bySession[s.id] }))
+    // 标题优先用 Desktop 侧边栏里的标题，找会话时和侧边栏对得上；搜索也按它匹配
+    const everything = mergeSessions(aggs).map(s => {
+      const dm = accounts.desktopMeta?.[s.id]
+      return { ...s, account: accounts.bySession[s.id], title: dm?.title ?? s.title, hasTitle: s.hasTitle || dm?.title !== undefined }
+    })
+    const excluded = new Set(settings.excluded ?? [])
+    const all = excluded.size > 0 ? everything.filter(s => !excluded.has(s.project)) : everything
     const scoped =
       view.account === undefined
         ? all
@@ -623,31 +644,31 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
     const prompted = total.in + total.cr + total.cw
 
     const prevDays = prevRangeDays(view.range, now, tzMin)
-    let prevUsd: number | undefined
     let prevTokens: number | undefined
     if (prevDays) {
       const prev = emptyTotals()
       for (const s of scoped) addSession(prev, s, prevDays)
-      prevUsd = prev.usd
       prevTokens = tokensOf(prev)
     }
-    const delta = prevUsd !== undefined && prevUsd > 0.5 ? (total.usd - prevUsd) / prevUsd : undefined
     const tokenDelta =
       prevTokens !== undefined && prevTokens > 100_000 ? (tokensOf(total) - prevTokens) / prevTokens : undefined
 
-    const byAccount = new Map<string, number>()
+    const byAccount = new Map<string, { tokens: number; usd: number }>()
     if (view.account === undefined) {
       for (const s of all) {
         let usd = 0
-        for (const [k, v] of Object.entries(s.dayUsd)) {
-          if (!days || days.has(k)) usd += v
+        let tokens = 0
+        for (const [k, d] of Object.entries(s.days)) {
+          if (days && !days.has(k)) continue
+          usd += s.dayUsd[k] ?? 0
+          tokens += tokensOf(d)
         }
-        if (usd <= 0) continue
+        if (tokens <= 0) continue
         const k = s.account ?? 'none'
-        byAccount.set(k, (byAccount.get(k) ?? 0) + usd)
+        const cur = byAccount.get(k) ?? { tokens: 0, usd: 0 }
+        byAccount.set(k, { tokens: cur.tokens + tokens, usd: cur.usd + usd })
       }
     }
-    const accountTotal = [...byAccount.values()].reduce((a, b) => a + b, 0)
 
     // 订阅额度：当前账号取实时读数（短期缓存避免高频重渲染重复 RPC），其他账号取切换前存下的最后读数
     const storedLimits = await getLimits($)
@@ -682,30 +703,78 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       series.push(p)
     }
 
-    const parts = [...PARTS].sort((a, b) => total.usdBy[b.key] - total.usdBy[a.key])
-    const topPart = parts[0]
-    // 2×2 决策排行：项目（按成本）、模型（按成本）、工具（按上下文估算 token）、技能（按次数 + 已装未用）
+    // 决策排行：模型（按成本）、工具（按上下文估算 token）
     const ranks = rankIndex(active, days, view.expandMcp ?? false)
-    // 兼容旧状态：项目筛选统一归入 activeProject，其余排行（模型/工具/技能）归入 activePick，两者可叠加
-    const activeProject = view.project ?? (view.pick?.kind === 'proj' ? view.pick.key : undefined)
+    // 旧状态里可能残留已移除的排行（如 prog、proj、skill），只认当前存在的排行
     const activePick =
-      view.pick && view.pick.kind !== 'proj' && (view.pick.kind as string) !== 'prog' ? view.pick : undefined
+      view.pick && view.pick.kind in ranks ? view.pick : undefined
+    const pickLabel = activePick ? (activePick.kind === 'model' ? prettyModel(activePick.key) : activePick.key) : ''
     const pickedIds = activePick ? (ranks[activePick.kind]?.get(activePick.key)?.ids ?? new Set<string>()) : undefined
+    // 只剩「按时间」「按 token」：旧状态里的 cost 按 token 排，context 退回按时间
+    const sortMode: InsightSort = view.sort === 'cost' ? 'tokens' : view.sort === 'context' ? 'recent' : view.sort
     const sorted = [...active]
-      .filter(s => (activeProject === undefined || s.project === activeProject) && (pickedIds === undefined || pickedIds.has(s.id)))
-      .sort((a, b) => (view.sort === 'cost' ? b.r.usd - a.r.usd : b.lastAt - a.lastAt))
-    /** 会话 id → 主日志文件（双击后从它还原上下文） */
-    const mainFiles = new Map(aggs.filter(a => !a.isSub).map(a => [a.id, a.file] as const))
-    const PAGE_SIZE = 6
-    const { page, totalPages, slice: shownSessions } = paginate(sorted, view.page, PAGE_SIZE)
-    const projChips = projectChips(active, activeProject)
+      .filter(
+        s =>
+          (pickedIds === undefined || pickedIds.has(s.id)) &&
+          matchSession(s, view.query),
+      )
+      .sort((a, b) =>
+        sortMode === 'tokens' ? tokensOf(b.r) - tokensOf(a.r) : b.lastAt - a.lastAt,
+      )
+    // 会话以项目为主线：项目一行，展开后列出它的会话
+    const groups = groupByProject(sorted, sortMode)
+    const isFiltering = activePick !== undefined || Boolean(view.query?.trim())
+    // 只区分主页与设置页；旧状态里的 sessions / tools 页签都按主页处理
+    const tab: InsightTab = view.tab === 'settings' ? 'settings' : 'overview'
+    // 「会话」模块高度固定（minHeight，见 sessionBodyRows），展开/收起项目、翻页都不改变模块高度：
+    // 项目分页；一次只展开一个项目，展开时其他项目整个隐藏（不占高度），展开的项目里会话再分页；
+    // 分页器固定在模块底部。每页项目数按模块高度算，让项目列表刚好填满
+    const tier = layoutTier(e.props.bodyColumns)
+    const isNarrow = tier === 'narrow'
+    const SESSIONS_PER_PAGE = 5
+    // 高度估算（单位：字符行，minHeight 的单位）。桌面端的文字行、间距、内边距都比一个字符行小，
+    // 按实测折算；终端按字符行整数算
+    const U =
+      e.surface === 'terminal'
+        ? { line: 1, gap: 1, pad: 1, cardExtra: 2, listRow: 2, pager: 1 }
+        : { line: 0.9, gap: 0.5, pad: 0.5, cardExtra: 1, listRow: 1.5, pager: 0.9 }
+    /** 一个会话卡片：两行文字加边框与内边距 */
+    const rowH = 2 * U.line + U.cardExtra
+    /** 展开一个有 n 个会话的项目所需的行数：项目头 + 间距 + 内边距 + 卡片们 +（多页时）底部分页器 */
+    const openRows = (n: number) => {
+      const k = Math.min(SESSIONS_PER_PAGE, Math.max(1, n))
+      return U.line + U.gap + U.pad + k * rowH + (k - 1) * U.gap + (n > SESSIONS_PER_PAGE ? U.gap + U.pager : 0)
+    }
+    const expandedMax = Math.max(0, ...groups.map(g => openRows(g.sessions.length)))
+    const PROJECTS_PER_PAGE = Math.max(5, Math.min(14, Math.floor((expandedMax - U.gap - U.pager) / U.listRow)))
+    const projectPages = Math.max(1, Math.ceil(groups.length / PROJECTS_PER_PAGE))
+    const projectPage = Math.min(Math.max(0, view.page ?? 0), projectPages - 1)
+    const shownGroups = groups.slice(projectPage * PROJECTS_PER_PAGE, (projectPage + 1) * PROJECTS_PER_PAGE)
+    /**
+     * 展开哪个项目（一次只有一个）：
+     * - 用户点开的那个；用户收起后（空字符串）一个都不展开，显示项目列表
+     * - 没选过（或选的不在本页）：搜索或筛选时，只有一个项目有结果就直接展开它（结果多个项目时显示项目列表，各带命中数）；
+     *   平时展开「当前会话所在的项目」，当前会话不在本页就展开本页第一个
+     */
+    const wanted = view.openProjects?.[0]
+    const currentGroup = shownGroups.find(g => g.sessions.some(x => x.id === currentSessionId))?.name
+    const defaultOpen = isFiltering ? (groups.length === 1 ? groups[0]?.name : undefined) : (currentGroup ?? shownGroups[0]?.name)
+    const openProject =
+      wanted === '' ? undefined : wanted !== undefined && shownGroups.some(g => g.name === wanted) ? wanted : defaultOpen
+    const isProjectOpen = (name: string) => name === openProject
+    /** 展开时隐藏其他项目：不占高度 */
+    const visibleGroups = openProject !== undefined ? shownGroups.filter(g => g.name === openProject) : shownGroups
     // 宽屏下把「钱花在哪」与「每日成本」并排，压缩纵向滚动长度
-    const isWideCharts = e.props.bodyColumns >= 84
-    const chartColWidth = isWideCharts ? half : full
-    const donutRow = chartColWidth >= 320
-    const showPartTokens = !isWideCharts || chartColWidth >= 420
     const showAccounts = view.account === undefined && byAccount.size > 1
-    const heat = buildHeatMap(scoped, today)
+    /**
+     * 「会话」模块的固定高度（行）：项目列表与任一项目展开后的行数取大，两种状态都按它撑满，
+     * 展开、收起、翻页都不改变模块高度。用 minHeight 而不是 height，估少了也只是略高、不会裁掉内容
+     */
+    const listRows = shownGroups.length * U.listRow + (projectPages > 1 ? U.gap + U.pager : 0)
+    const sessionBodyRows = Math.ceil(Math.max(listRows, expandedMax))
+    const openGroup = openProject !== undefined ? visibleGroups[0] : undefined
+    const openPages = openGroup ? Math.max(1, Math.ceil(openGroup.sessions.length / SESSIONS_PER_PAGE)) : 1
+    const openPage = Math.min(Math.max(0, view.sessionPage ?? 0), openPages - 1)
 
     // ----- 小组件 -----
     /** 区块卡片：标题 · 旁注 ··· 右上角关键数字 · 操作 */
@@ -716,7 +785,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       right?: JSX.Element | null
       children?: unknown
     }) => (
-      <Box flexDirection="column" gap={1} {...card}>
+      <Box flexDirection="column" gap={2} {...card}>
         <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
           <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1}>
             <Text weight="semibold">{props.title}</Text>
@@ -729,7 +798,7 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           {props.stat || props.right ? (
             <Box flexDirection="row" columnGap={2} alignItems="center">
               {props.stat ? (
-                <Text tabular weight="medium">
+                <Text tabular dimColor size="footnote">
                   {props.stat}
                 </Text>
               ) : null}
@@ -740,209 +809,48 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
         {props.children as JSX.Element}
       </Box>
     )
-    /** KPI 宫格：宽面板 3 列、窄面板 2 列，按行铺满整宽，每格「标签 / 大数字 / 一行小注」 */
-    const kpiCols = e.props.bodyColumns >= 72 ? 3 : 2
-    const kpi = (key: string, label: string, value: string, note?: { text: string; color?: string }) => (
-      <Box key={key} flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0} {...card}>
-        <Text dimColor size="footnote" wrap="truncate-end">
-          {label}
-        </Text>
-        <Text weight="bold" size="title" tabular wrap="truncate-end">
-          {value}
-        </Text>
-        {note ? (
-          <Text size="footnote" color={note.color} dimColor={note.color === undefined} wrap="truncate-end">
-            {note.text}
-          </Text>
-        ) : null}
-      </Box>
-    )
-    /** 环比小注：涨超 5% 橙色、降超 5% 绿色 */
-    const changeNote = (change: number | undefined) =>
-      change === undefined
-        ? undefined
-        : {
-            text:
-              Math.abs(change) < 0.005
-                ? `持平 比${PREV_TITLE[view.range]}`
-                : `${change > 0 ? '↑' : '↓'} ${Math.abs(change * 100).toFixed(0)}% 比${PREV_TITLE[view.range]}`,
-            color: change > 0.05 ? ORANGE : change < -0.05 ? TEAL : undefined,
-          }
-    /** 图例：■ 名称 · [token] · 金额 · 占比 */
-    const legendRow = (
-      key: string,
-      color: string,
-      name: string,
-      amount: string,
-      share: string,
-      isDim = false,
-      tokens?: string,
-    ) => (
-      <Box key={key} flexDirection="row" alignItems="center" columnGap={2}>
-        <Box flexDirection="row" flexGrow={1} columnGap={1}>
-          <Text color={color}>■</Text>
-          <Text wrap="truncate-end" dimColor={isDim}>
-            {name}
-          </Text>
-        </Box>
-        {tokens !== undefined ? (
-          <Box minWidth={11} justifyContent="flex-end">
-            <Text tabular dimColor>
-              {tokens}
-            </Text>
-          </Box>
-        ) : null}
-        <Box minWidth={9} justifyContent="flex-end">
-          <Text tabular dimColor>
-            {amount}
-          </Text>
-        </Box>
-        <Box minWidth={7} justifyContent="flex-end">
-          <Text tabular dimColor={isDim}>
-            {share}
-          </Text>
-        </Box>
-      </Box>
-    )
-    /**
-     * 排行：「名称 · 主数值 · [副信息]」，下面一条细进度线；点一项筛选下方的会话，再点取消。
-     * 默认 RANK_VISIBLE 行，可展开到 RANK_MAX 行。
-     */
-    const rankList = (
-      kind: RankKind,
-      fmt: (v: number) => string,
-      extraCol?: (it: RankItem) => string | undefined,
-      width = half,
-    ) => {
-      const rows = [...ranks[kind].entries()].filter(([, it]) => it.value > 0).sort((a, b) => b[1].value - a[1].value)
-      if (rows.length === 0) return <Text dimColor>暂无</Text>
-      const isOpen = view.openRanks?.includes(kind) ?? false
-      const max = rows[0]?.[1].value ?? 1
-      const isProj = kind === 'proj'
-      const pickedHere = isProj ? activeProject !== undefined : activePick?.kind === kind
-      return (
-        <Box flexDirection="column" gap={1}>
-          {rows.slice(0, isOpen ? RANK_MAX : RANK_VISIBLE).map(([k, it], i) => {
-            const isPicked = isProj ? activeProject === k : pickedHere && activePick?.key === k
-            const extra = extraCol?.(it)
-            return (
-              <Box key={`rk-${kind}-${k}`} flexDirection="column">
-                <Box flexDirection="row" alignItems="center" columnGap={2}>
-                  <Box flexGrow={1} flexShrink={1} minWidth={0}>
-                    <Button
-                      key={`pick-${kind}-${k}`}
-                      plain
-                      dimColor={pickedHere && !isPicked}
-                      onPress={() =>
-                        setView(v =>
-                          isProj
-                            ? {
-                                ...v,
-                                project: isPicked ? undefined : k,
-                                pick: v.pick?.kind === 'proj' ? undefined : v.pick,
-                                page: 0,
-                              }
-                            : { ...v, pick: isPicked ? undefined : { kind, key: k }, page: 0 },
-                        )
-                      }
-                    >
-                      <Text wrap="truncate-end" color={isPicked ? ACCENT : undefined} weight={isPicked ? 'semibold' : 'regular'}>
-                        {isPicked ? `✓ ${k}` : k}
-                      </Text>
-                    </Button>
-                  </Box>
-                  {Svg ? null : <Text color={ACCENT}>{textBar((it.value / max) * 100, 6)}</Text>}
-                  <Text tabular>{fmt(it.value)}</Text>
-                  {extra !== undefined ? (
-                    <Box minWidth={8} justifyContent="flex-end">
-                      <Text dimColor size="footnote" tabular>
-                        {extra}
-                      </Text>
-                    </Box>
-                  ) : null}
-                </Box>
-                {Svg ? (
-                  <Svg
-                    source={lineSvg(it.value / max, width, i === 0 || isPicked ? ACCENT : GREY)}
-                    alt={`${k} ${fmt(it.value)}`}
-                    width={width}
-                    height={4}
-                  />
-                ) : null}
-              </Box>
-            )
-          })}
-          {rows.length > RANK_VISIBLE ? (
-            <Button
-              key={`open-${kind}`}
-              label={
-                isOpen
-                  ? rows.length > RANK_MAX
-                    ? `收起（已显示前 ${RANK_MAX} 项，共 ${rows.length} 项）`
-                    : '收起'
-                  : rows.length > RANK_MAX
-                    ? `显示前 ${RANK_MAX} 项（共 ${rows.length} 项）`
-                    : `显示全部 ${rows.length} 项`
-              }
-              plain
-              dimColor
-              onPress={() =>
-                setView(v => ({
-                  ...v,
-                  openRanks: isOpen ? (v.openRanks ?? []).filter(x => x !== kind) : [...(v.openRanks ?? []), kind],
-                }))
-              }
-            />
-          ) : null}
-        </Box>
-      )
-    }
-    /** 一个额度窗口：名称 · 条 · 已用 · 重置时间 */
-    const quotaRow = (key: string, w: RateWindow) => {
+    /** 一个额度窗口：上行「窗口名 ··· 重置时刻 已用%」，下行进度条（与 Claude 自带用量界面同风格）；桌面端整行画成一张图，百分比对齐进度条右端 */
+    const quotaRow = (key: string, w: RateWindow, barWidth: number, isStale: boolean) => {
       const resetAt = w.resetsAt ? Date.parse(w.resetsAt) : NaN
       const isReset = !Number.isNaN(resetAt) && resetAt <= now
       const p = Math.max(0, Math.min(100, w.percentUsed))
-      const color = p >= 80 ? ORANGE : ACCENT
+      // 80% 起变黄、95% 起变橙，与会话上下文的配色规则一致
+      const color = p >= 95 ? ORANGE : p >= 80 ? AMBER : ACCENT
+      const name = quotaWindowName(w.kind)
+      const reset = Number.isNaN(resetAt) ? '' : isReset ? '已重置' : `${fmtResetAt(resetAt, now, tzMin)} 重置`
+      const percent = isReset ? '—' : `已用 ${w.percentUsed}%`
+      if (Svg) {
+        return (
+          <Box key={key}>
+          <Chart
+            source={quotaSvg(name, reset, percent, isReset ? 0 : p / 100, color, barWidth, undefined, isStale)}
+            alt={`${name} ${reset} ${percent}`}
+          />
+          </Box>
+        )
+      }
       return (
-        <Box key={key} flexDirection="row" alignItems="center" columnGap={2}>
-          <Box minWidth={10}>
-            <Text>{windowLabel(w.kind)}</Text>
-          </Box>
-          <Box flexGrow={1}>
-            {Svg ? (
-              <Chart
-                source={stackSvg(
-                  [
-                    { name: '已用', value: isReset ? 0 : p, color, note: `${w.percentUsed}%` },
-                    { name: '剩余', value: isReset ? 100 : 100 - p, color: 'track' },
-                  ],
-                  Math.max(120, full - 300),
-                )}
-                alt={`${windowLabel(w.kind)}额度已用 ${w.percentUsed}%`}
-              />
-            ) : (
-              <Text color={color}>{textBar(isReset ? 0 : p, 20)}</Text>
-            )}
-          </Box>
-          <Box minWidth={6} justifyContent="flex-end">
-            <Text tabular weight="semibold" color={isReset ? undefined : p >= 80 ? ORANGE : undefined} dimColor={isReset}>
-              {isReset ? '—' : `${w.percentUsed}%`}
+        <Box key={key} flexDirection="column">
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
+            <Text wrap="truncate-end">{name}</Text>
+            <Text tabular>
+              <Text dimColor>{reset} </Text>
+              <Text color={!isReset && p >= 80 ? color : undefined} dimColor={isReset}>
+                {percent}
+              </Text>
             </Text>
           </Box>
-          <Box minWidth={16} justifyContent="flex-end">
-            <Text dimColor size="footnote" tabular>
-              {Number.isNaN(resetAt) ? '' : isReset ? '已重置' : `${fmtUntil(resetAt - now)}后重置`}
-            </Text>
-          </Box>
+          <Text color={color}>{textBar(isReset ? 0 : p, 20)}</Text>
         </Box>
       )
     }
-    const count = (v: number) => `×${v}`
-    const toolCalls = Object.values(total.tools).reduce((a, n) => a + n, 0)
+    // 订阅额度：所有账号都完整显示，宽面板每行两个账号
+    const quotaCols = isNarrow || shownLimits.length < 2 ? 1 : 2
+    // 两个账号在同一张卡片里分两列（不是两张卡片），列宽≈(整宽-列间距)/2；宁可略估大，SVG 的 max-width:100% 会缩回列内
+    const quotaBarWidth = Math.max(80, quotaCols === 2 ? Math.floor((full - 24) / 2) : full)
+    const quotaRows: (typeof shownLimits)[] = []
+    for (let i = 0; i < shownLimits.length; i += quotaCols) quotaRows.push(shownLimits.slice(i, i + quotaCols))
     const toolTotalTokens = [...ranks.tool.values()].reduce((a, it) => a + it.value, 0)
-    const modelTotalUsd = total.usd > 0 ? [...ranks.model.values()].reduce((a, it) => a + it.value, 0) : 0
-    const skillTotalCalls = [...ranks.skill.values()].reduce((a, it) => a + it.value, 0)
-    const unusedSkills = installedSkills.filter(s => !ranks.skill.has(s))
     const pctDone = scan.totalBytes > 0 ? Math.round((scan.doneBytes / scan.totalBytes) * 100) : 100
 
     const accountOptions = [
@@ -951,216 +859,334 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
       ...(hasUnassigned ? [{ value: 'none', label: '未归属' }] : []),
     ]
 
-    const kpiItems = [
-      kpi(
-        'kpi-usd',
-        '等价 API 成本',
-        fmtUsd(total.usd),
-        changeNote(delta) ??
-          (unpriced > 0
-            ? { text: `${unpriced} 个会话无法估价` }
-            : { text: total.usd > 0 ? '按标价折算' : '暂无费用' }),
-      ),
-      kpi('kpi-tokens', 'Token 消耗', fmtTokens(tokensOf(total)), changeNote(tokenDelta) ?? { text: `${total.req} 次请求` }),
-      kpi('kpi-sessions', '会话', String(active.length), { text: `${total.prompts} 次提问` }),
-      kpi('kpi-cache', '缓存命中', pct(total.cr, prompted), { text: `读取 ${fmtTokens(total.cr)} token` }),
-      kpi(
-        'kpi-per-prompt',
-        '每次提问',
-        total.prompts > 0 ? fmtUsd(total.usd / total.prompts) : '—',
-        total.prompts > 0 ? { text: `${fmtTokens(Math.round(tokensOf(total) / total.prompts))} token` } : { text: '暂无提问' },
-      ),
-      kpi(
-        'kpi-tools',
-        '工具调用',
-        String(toolCalls),
-        { text: toolTotalTokens > 0 ? `占上下文约 ${fmtTokens(toolTotalTokens)}` : `${ranks.tool.size} 种工具` },
-      ),
-    ]
-    const kpiRows: JSX.Element[][] = []
-    for (let i = 0; i < kpiItems.length; i += kpiCols) kpiRows.push(kpiItems.slice(i, i + kpiCols))
-
-    const costBreakdownCard = (
-      <Section title="钱花在哪" stat={total.usd > 0 ? `合计 ${fmtUsd(total.usd)}` : undefined}>
-        <Box flexDirection={Svg && total.usd > 0 && donutRow ? 'row' : 'column'} alignItems={Svg && total.usd > 0 && donutRow ? 'center' : 'stretch'} columnGap={3} rowGap={2}>
-          {Svg && total.usd > 0 ? (
-            <Chart
-              source={donutSvg(
-                parts.map(p => ({ name: p.name, value: total.usdBy[p.key], color: p.color, note: `${fmtUsd(total.usdBy[p.key])} · ${fmtTokens(total[p.key])} token` })),
-                96,
-                { top: fmtUsd(total.usd), sub: '合计' },
-              )}
-              alt="成本构成"
-              isInteractive
-            />
-          ) : null}
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
-            {parts.map(p =>
-              legendRow(
-                `part-${p.key}`,
-                p.color,
-                p.name,
-                fmtUsd(total.usdBy[p.key]),
-                pct(total.usdBy[p.key], total.usd),
-                total.usdBy[p.key] === 0,
-                showPartTokens ? `${fmtTokens(total[p.key])} token` : undefined,
-              ),
-            )}
-          </Box>
-        </Box>
-        {topPart && total.usd > 0 ? (
-          <Text dimColor size="footnote">
-            {topPart.name}占 {pct(total.usdBy[topPart.key], total.usd)}：{PART_HINT[topPart.key]}。
-          </Text>
-        ) : null}
-      </Section>
-    )
-
-    const dailyCostCard = (
-      <Section
-        title="每日成本"
-        note={Svg ? '悬停柱子看明细' : undefined}
-        stat={`今天 ${fmtUsd(series[series.length - 1]?.usd ?? 0)} · 日均 ${fmtUsd(dailyAverage(series))}`}
-      >
-        {Svg ? (
-          <Chart source={dailySvg(series, chartColWidth)} alt={`最近 ${seriesDays} 天每日预估成本`} isInteractive />
-        ) : (
-          <Text color={ACCENT}>
-            {sparkline(
-              series.map(s => s.usd),
-              Math.max(...series.map(s => s.usd)),
-            )}
-          </Text>
-        )}
-      </Section>
-    )
-
-    const accountsCard = showAccounts ? (
-      <Section title="账号" stat={`合计 ${fmtUsd(accountTotal)}`}>
-        <Box flexDirection={Svg && donutRow ? 'row' : 'column'} alignItems={Svg && donutRow ? 'center' : 'stretch'} columnGap={3} rowGap={2}>
+    /** 构成表的一行：色块 · 名称（可点）· token · token 占比 · ≈ 金额（金额为辅，可在设置里关掉） */
+    type ShareRow = {
+      key: string
+      name: string
+      tokens: number
+      usd: number
+      color: string
+      isPicked: boolean
+      onPress?: () => void
+    }
+    /** 构成表：上面一根细分段条，下面固定行数的明细，切换维度时高度不变 */
+    const breakdownTable = (id: string, rows: ShareRow[], slots: number) => {
+      const sum = rows.reduce((a, r) => a + r.tokens, 0)
+      const pad = Math.max(0, slots - rows.length)
+      return (
+        <Box key={`share-${id}`} flexDirection="column" gap={1}>
           {Svg ? (
-            <Chart
-              source={donutSvg(
-                [...byAccount.entries()]
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([k, v], i) => ({
-                    name: k === 'none' ? '未归属' : accountLabel(accounts, k),
-                    value: v,
-                    color: ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE,
-                    note: fmtUsd(v),
-                  })),
-                96,
-                { top: fmtUsd(accountTotal), sub: `${byAccount.size} 账号` },
-              )}
-              alt="各账号成本占比"
-              isInteractive
-            />
+            <Chart source={thinStackSvg(rows.map(r => ({ value: r.tokens, color: r.color })), full)} alt="token 构成" />
           ) : null}
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
-            {[...byAccount.entries()]
-              .sort((a, b) => b[1] - a[1])
-              .map(([k, v], i) =>
-                legendRow(
-                  `acct-${k}`,
-                  ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE,
-                  k === 'none' ? '未归属' : accountLabel(accounts, k),
-                  fmtUsd(v),
-                  pct(v, accountTotal),
-                ),
-              )}
-          </Box>
-        </Box>
-      </Section>
-    ) : null
-
-    const heatmapCard = (
-      <Section
-        title="活跃度"
-        note={Svg ? '悬停看当天明细' : undefined}
-        stat={
-          heat.active30 > 0
-            ? `近 30 天活跃 ${heat.active30} 天${heat.streak >= 2 ? ` · 连续 ${heat.streak} 天` : ''}`
-            : '近 30 天无活动'
-        }
-      >
-        {Svg ? (
-          <Chart source={heatmapSvg(heat.byDay, today, isWideCharts && showAccounts ? half : full)} alt="活跃度热力图" isInteractive />
-        ) : (
-          <Text dimColor>
-            近 30 天活跃 {heat.active30} 天{heat.streak >= 2 ? ` · 连续 ${heat.streak} 天` : ''}
-          </Text>
-        )}
-      </Section>
-    )
-
-    // ----- 版面 -----
-    return (
-      <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
-        {/* 工具栏 */}
-        <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" rowGap={1} columnGap={2}>
-          <Box flexDirection="row" columnGap={1}>
-            {RANGES.map(([r, label]) => (
-              <Button
-                key={`range-${r}`}
-                label={label}
-                variant={view.range === r ? 'primary' : 'secondary'}
-                onPress={() => setView(v => ({ ...v, range: r, page: 0 }))}
-              />
+          <Box flexDirection="column">
+            {rows.map(r => {
+              const label = (
+                <Text wrap="truncate-end" weight={r.isPicked ? 'semibold' : 'regular'} color={r.isPicked ? ACCENT : undefined}>
+                  {r.isPicked ? `✓ ${r.name}` : r.name}
+                </Text>
+              )
+              return (
+                <Box key={`share-${id}-${r.key}`} flexDirection="row" alignItems="center" columnGap={2}>
+                  <Text color={r.color}>■</Text>
+                  <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                    {r.onPress ? (
+                      <Button key={`share-btn-${id}-${r.key}`} plain onPress={r.onPress}>
+                        {label}
+                      </Button>
+                    ) : (
+                      label
+                    )}
+                  </Box>
+                  <Box minWidth={8} justifyContent="flex-end">
+                    <Text tabular>{fmtTokens(r.tokens)}</Text>
+                  </Box>
+                  <Box minWidth={6} justifyContent="flex-end">
+                    <Text tabular dimColor>
+                      {pct(r.tokens, sum)}
+                    </Text>
+                  </Box>
+                  {showMoney ? (
+                    <Box minWidth={isNarrow ? 8 : 10} justifyContent="flex-end">
+                      <Text tabular dimColor>
+                        ≈ {fmtUsd(r.usd)}
+                      </Text>
+                    </Box>
+                  ) : null}
+                </Box>
+              )
+            })}
+            {Array.from({ length: pad }, (_, i) => (
+              <Text key={`share-${id}-pad-${i}`}> </Text>
             ))}
           </Box>
-          <Box flexDirection="row" columnGap={2} alignItems="center">
-            {accountIds.length > 0 ? (
-              <Select
-                key="account"
-                options={accountOptions}
-                value={view.account ?? 'all'}
-                onSelect={value => setView(v => ({ ...v, account: value === 'all' ? undefined : value, page: 0 }))}
-              />
-            ) : null}
-            <Button
-              key="rescan"
-              label={scan.isRunning ? `扫描中 ${pctDone}%` : '刷新'}
-              plain
-              dimColor
-              onPress={() => void runScan($)}
-            />
-          </Box>
         </Box>
+      )
+    }
+    const modelRows: ShareRow[] = [...ranks.model.entries()]
+      .filter(([, it]) => it.tokens > 0)
+      .sort((a, b) => b[1].tokens - a[1].tokens)
+      .map(([k, it], i) => {
+        const isPicked = activePick?.kind === 'model' && activePick.key === k
+        return {
+          key: k,
+          name: prettyModel(k),
+          tokens: it.tokens,
+          usd: it.value,
+          color: PALETTE[i % PALETTE.length] ?? BLUE,
+          isPicked,
+          onPress: () =>
+            setView(v => ({
+              ...v,
+              pick: isPicked ? undefined : { kind: 'model', key: k },
+              page: 0,
+              sessionPage: 0,
+            })),
+        }
+      })
+    /** 账号的固定颜色：按账号在下拉框里的顺序取，会话行的小圆点与「按账号」图例同色 */
+    const acctColor = (id: string): string => ACCOUNT_COLORS[Math.max(0, accountIds.indexOf(id)) % ACCOUNT_COLORS.length] ?? BLUE
+    const accountRows: ShareRow[] = [...byAccount.entries()]
+      .sort((a, b) => b[1].tokens - a[1].tokens)
+      .map(([k, v], i) => ({
+        key: k,
+        // 只留 @ 前面的部分，和会话行写法一致
+        name: k === 'none' ? '未归属' : accountLabel(accounts, k).replace(/@[^（]*/, ''),
+        tokens: v.tokens,
+        usd: v.usd,
+        color: k === 'none' ? (ACCOUNT_COLORS[i % ACCOUNT_COLORS.length] ?? BLUE) : acctColor(k),
+        isPicked: false,
+        onPress: () => setView(vw => ({ ...vw, account: k, page: 0 })),
+      }))
 
-        {scan.error ? <Text color="error">扫描出错：{scan.error}</Text> : null}
-
-        {/* 订阅额度：重度用户最关心会不会撞上限 */}
-        <Section
-          title="订阅额度"
-          note={
-            shownLimits.length === 0
-              ? view.account === 'none'
-                ? '未归属的会话没有对应账号的额度'
-                : '发一条消息后显示'
-              : undefined
-          }
-          stat={shownLimits[0]?.isLive ? '实时' : undefined}
-        >
-          {shownLimits.map(r => (
-            <Box key={`quota-${r.account}`} flexDirection="column" gap={1}>
-              {limitRows.length > 1 || !r.isLive ? (
-                <Text dimColor size="footnote">
-                  {accountLabel(accounts, r.account === 'current' ? undefined : r.account).replace('未归属', '当前账号')}
-                  {r.isLive ? '' : ` · ${fmtAgo(now - r.at)}的读数，切换到该账号后更新`}
-                </Text>
+    /**
+     * 工具上下文：左边两个环形图（累计 token、调用次数），右边共用一张图例表。
+     * 前 5 个工具单独着色，其余合成一块；同一工具在两个环里同色。
+     * 图例中间的双条把两种占比并排，一眼看出「调用少却占得多」的工具。
+     */
+    const TOOL_TOP = 5
+    const TOOL_COLORS = [BLUE, ORANGE, TEAL, AMBER, '#8B5CF6']
+    const toolItems = [...ranks.tool.entries()].filter(([, it]) => it.value > 0).sort((a, b) => b[1].value - a[1].value)
+    const toolTotalCalls = toolItems.reduce((a, [, it]) => a + it.subCount, 0)
+    type ToolSlice = { key: string; name: string; tokens: number; calls: number; color: string; isRest: boolean }
+    const toolSlices: ToolSlice[] = toolItems.slice(0, TOOL_TOP).map(([k, it], i) => ({
+      key: k,
+      name: k,
+      tokens: it.value,
+      calls: it.subCount,
+      color: TOOL_COLORS[i] ?? GREY,
+      isRest: false,
+    }))
+    const toolRest = toolItems.slice(TOOL_TOP)
+    if (toolRest.length > 0) {
+      toolSlices.push({
+        key: '__rest',
+        name: `其余 ${toolRest.length} 个`,
+        tokens: toolRest.reduce((a, [, it]) => a + it.value, 0),
+        calls: toolRest.reduce((a, [, it]) => a + it.subCount, 0),
+        color: GREY,
+        isRest: true,
+      })
+    }
+    const DONUT = 104
+    const showToolBars = Boolean(Svg) && !isNarrow
+    // 环形图与图例并排时，图例约占整宽减去两个环；双条吃掉名称与数字列之外的空间
+    const legendWidth = isNarrow ? full : full - DONUT * 2 - 48
+    const dualBarWidth = Math.max(40, Math.min(360, legendWidth - 150 - 170))
+    const toolCard = (
+      <Section title="工具上下文" stat={toolItems.length > 0 ? `${toolItems.length} 个工具` : undefined}>
+        {toolItems.length === 0 ? (
+          <Text dimColor>暂无</Text>
+        ) : (
+          <Box flexDirection="column" gap={2}>
+            <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={4} rowGap={2}>
+              {Svg ? (
+                <Box flexDirection="row" columnGap={3} flexShrink={0}>
+                  <Chart
+                    source={donutSvg(
+                      toolSlices.map(t => ({ name: t.name, value: t.tokens, color: t.color })),
+                      DONUT,
+                      { top: fmtTokens(toolTotalTokens), sub: '累计 token' },
+                    )}
+                    alt={`工具累计 token ${fmtTokens(toolTotalTokens)}`}
+                  />
+                  <Chart
+                    source={donutSvg(
+                      toolSlices.map(t => ({ name: t.name, value: t.calls, color: t.color })),
+                      DONUT,
+                      { top: toolTotalCalls.toLocaleString(), sub: '次数' },
+                    )}
+                    alt={`工具调用 ${toolTotalCalls} 次`}
+                  />
+                </Box>
               ) : null}
-              {r.windows.map(w => quotaRow(`q-${r.account}-${w.kind}`, w))}
+              <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={30}>
+                <Box flexDirection="row" alignItems="center" columnGap={2}>
+                  <Box flexGrow={1}>
+                    <Text dimColor size="footnote">
+                      工具
+                    </Text>
+                  </Box>
+                  {showToolBars ? (
+                    <Box minWidth={Math.round(dualBarWidth / 7)}>
+                      <Text dimColor size="footnote">
+                        <Text color={GREY}>▬</Text> token 占比 <Text dimColor>▬</Text> 次数占比
+                      </Text>
+                    </Box>
+                  ) : null}
+                  <Box minWidth={12} justifyContent="flex-end">
+                    <Text dimColor size="footnote">
+                      累计 token
+                    </Text>
+                  </Box>
+                  <Box minWidth={11} justifyContent="flex-end">
+                    <Text dimColor size="footnote">
+                      次数
+                    </Text>
+                  </Box>
+                </Box>
+                {toolSlices.map(t => {
+                  const isPicked = activePick?.kind === 'tool' && activePick.key === t.key
+                  const mcp = /（MCP）$/.test(t.name)
+                  const label = (
+                    <Text wrap="truncate-end" color={isPicked ? ACCENT : undefined} weight={isPicked ? 'semibold' : 'regular'}>
+                      {isPicked ? '✓ ' : ''}
+                      {mcp ? t.name.replace('（MCP）', '') : t.name}
+                      {mcp ? (
+                        <Text dimColor size="footnote">
+                          {' '}
+                          MCP
+                        </Text>
+                      ) : null}
+                    </Text>
+                  )
+                  return (
+                    <Box key={`tool-${t.key}`} flexDirection="row" alignItems="center" columnGap={2}>
+                      <Text color={t.color}>■</Text>
+                      <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                        {t.isRest ? (
+                          label
+                        ) : (
+                          <Button
+                            key={`pick-tool-${t.key}`}
+                            plain
+                            dimColor={activePick?.kind === 'tool' && !isPicked}
+                            onPress={() =>
+                              setView(v => ({
+                                ...v,
+                                pick: isPicked ? undefined : { kind: 'tool', key: t.key },
+                                page: 0,
+                                sessionPage: 0,
+                                                }))
+                            }
+                          >
+                            {label}
+                          </Button>
+                        )}
+                      </Box>
+                      {showToolBars ? (
+                        <Chart
+                          source={dualBarSvg(t.tokens / toolTotalTokens, toolTotalCalls > 0 ? t.calls / toolTotalCalls : 0, t.color, dualBarWidth)}
+                          alt={`${t.name} token 占 ${pct(t.tokens, toolTotalTokens)}，次数占 ${pct(t.calls, toolTotalCalls)}`}
+                        />
+                      ) : null}
+                      <Box minWidth={12} justifyContent="flex-end">
+                        <Text tabular>
+                          {fmtTokens(t.tokens)}{' '}
+                          <Text dimColor size="footnote">
+                            {pct(t.tokens, toolTotalTokens)}
+                          </Text>
+                        </Text>
+                      </Box>
+                      <Box minWidth={11} justifyContent="flex-end">
+                        <Text tabular>
+                          {t.calls.toLocaleString()}{' '}
+                          <Text dimColor size="footnote">
+                            {pct(t.calls, toolTotalCalls)}
+                          </Text>
+                        </Text>
+                      </Box>
+                    </Box>
+                  )
+                })}
+              </Box>
             </Box>
-          ))}
-        </Section>
+            <Text dimColor size="footnote">
+              点工具可筛选会话。工具 token 约按 4 字符 ≈ 1 token 估算。
+            </Text>
+          </Box>
+        )}
+      </Section>
+    )
 
-        {/* KPI 宫格：一眼看清这段时间的规模、效率与活动量 */}
+    // 构成：类型 / 模型 / 账号三选一，一次只看一张表；都按 token 排
+    const typeRows: ShareRow[] = [...PARTS]
+      .sort((a, b) => total[b.key] - total[a.key])
+      .map((p, i) => ({
+        key: p.key,
+        name: p.name,
+        tokens: total[p.key],
+        usd: total.usdBy[p.key],
+        color: PALETTE[i] ?? p.color,
+        isPicked: false,
+      }))
+    const breakdownTabs: [Breakdown, string][] = [
+      ['type', '按类型'],
+      ...(modelRows.length > 0 ? ([['model', '按模型']] as [Breakdown, string][]) : []),
+      ...(showAccounts ? ([['account', '按账号']] as [Breakdown, string][]) : []),
+    ]
+    /** 构成表固定行数：取各维度里最多的那个（最多 BREAKDOWN_MAX 行），切换时高度不变 */
+    const BREAKDOWN_MAX = 6
+    const breakdownSlots = Math.min(
+      BREAKDOWN_MAX,
+      Math.max(typeRows.length, modelRows.length, showAccounts ? accountRows.length : 0),
+    )
+    const breakdown: Breakdown = breakdownTabs.some(([k]) => k === view.breakdown) ? (view.breakdown ?? 'type') : 'type'
+    const tokenTotal = tokensOf(total)
+    const tokenChange =
+      tokenDelta === undefined
+        ? undefined
+        : Math.abs(tokenDelta) < 0.005
+          ? `持平 比${PREV_TITLE[view.range]}`
+          : `${tokenDelta > 0 ? '↑' : '↓'} ${Math.abs(tokenDelta * 100).toFixed(0)}% 比${PREV_TITLE[view.range]}`
+    /** 主数字下的一排小指标：金额排第一格但字号与其余相同，只作参考 */
+    const usageStats: [string, string][] = [
+      ...(showMoney ? ([['等价 API 成本', `≈ ${fmtUsd(total.usd)}`]] as [string, string][]) : []),
+      ['会话', active.length.toLocaleString()],
+      ['提问', total.prompts.toLocaleString()],
+      ['缓存命中', pct(total.cr, prompted)],
+    ]
+    const avgTokens = series.length > 0 ? series.reduce((a, x) => a + x.tokens, 0) / series.length : 0
+
+    /** 用量：token 为主（本地记录，准确），金额为辅（按标价折算，估算） */
+    const spendCard = (
+      <Section title="用量" stat={RANGE_TITLE[view.range]}>
+        {/* 1. 主数字：token 总量与环比 */}
         <Box flexDirection="column" gap={2}>
-          {kpiRows.map((cells, i) => (
-            <Box key={`kpi-row-${i}`} flexDirection="row" columnGap={2}>
-              {cells}
-            </Box>
-          ))}
+          <Box flexDirection="row" flexWrap="wrap" alignItems="flex-end" columnGap={1}>
+            <Text weight="medium" size="title" tabular>
+              {fmtTokens(tokenTotal)}
+            </Text>
+            <Text dimColor>token</Text>
+            {tokenChange ? (
+              <Text dimColor size="footnote">
+                {'  '}
+                {tokenChange}
+              </Text>
+            ) : null}
+          </Box>
+          {/* 2. 一排小指标：标签在上、数值在下 */}
+          <Box flexDirection="row" columnGap={2}>
+            {usageStats.map(([label, value]) => (
+              <Box key={`stat-${label}`} flexDirection="column" flexGrow={1} width="25%" minWidth={0}>
+                <Text dimColor size="footnote" wrap="truncate-end">
+                  {label}
+                </Text>
+                <Text tabular wrap="truncate-end">
+                  {value}
+                </Text>
+              </Box>
+            ))}
+          </Box>
           {scan.isRunning ? (
             <Text dimColor size="footnote">
               正在读取会话日志 {scan.doneFiles}/{scan.totalFiles}，数字会随扫描增加
@@ -1168,571 +1194,533 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
           ) : null}
         </Box>
 
-        {/* 2×2 决策排行（默认折叠）：只保留能改变用法的 4 项——项目、模型、工具上下文、技能 */}
-        <Box flexDirection="column" gap={2}>
-          <Button
-            key="toggle-activity"
-            label={view.showActivity ? '▾ 更多' : '▸ 更多：项目、模型、工具上下文、技能'}
-            plain
-            onPress={() => setView(v => ({ ...v, showActivity: !v.showActivity }))}
-          />
-          {view.showActivity ? (
-            <Text dimColor size="footnote">
-              点任意项可筛选下方「会话」；再点一次取消。工具 token 按入参与返回内容估算（约 4 字符 ≈ 1 token）。
+        {/* 3. 每天的 token：折线 + 日均虚线 */}
+        <Box flexDirection="column">
+          {Svg ? (
+            <Chart source={dailyTokenSvg(series, full, 120, showMoney)} alt={`最近 ${seriesDays} 天每日 token`} isInteractive />
+          ) : (
+            <Text color={ACCENT}>
+              {sparkline(
+                series.map(x => x.tokens),
+                Math.max(...series.map(x => x.tokens)),
+              )}
             </Text>
-          ) : null}
-          {view.showActivity ? (
-            <Box flexDirection="column" gap={4}>
-              {/* 第一行：项目（按成本 + 最近日期） + 模型（按成本 + 占比） */}
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section title="项目" note="按成本" stat={ranks.proj.size > 0 ? `${ranks.proj.size} 个` : undefined}>
-                    {rankList('proj', v => fmtUsd(v), it => fmtDayAgo(it.lastDay, today))}
-                  </Section>
-                </Box>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section
-                    title="模型"
-                    note={modelTotalUsd > 0 ? '按成本' : '按请求数'}
-                    stat={ranks.model.size > 0 ? `${ranks.model.size} 个 · ${total.req} 次请求` : undefined}
-                  >
-                    {rankList(
-                      'model',
-                      v => (modelTotalUsd > 0 ? fmtUsd(v) : `×${Math.round(v * 1e9)}`),
-                      it => (modelTotalUsd > 0 ? pct(it.value, modelTotalUsd) : undefined),
-                    )}
-                  </Section>
-                </Box>
-              </Box>
-              {/* 第二行：工具上下文（按估算 token + 次数，支持展开 MCP） + 技能（使用次数 + 已装未用） */}
-              <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={4}>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section
-                    title="工具上下文"
-                    note="按估算 token"
-                    stat={toolTotalTokens > 0 ? `${ranks.tool.size} 项 · 约 ${fmtTokens(toolTotalTokens)}` : undefined}
-                    right={
-                      <Button
-                        key="toggle-mcp"
-                        label={view.expandMcp ? '合并 MCP' : '展开 MCP'}
-                        plain
-                        dimColor
-                        onPress={() =>
-                          setView(v => ({
-                            ...v,
-                            expandMcp: !v.expandMcp,
-                            // 合并/展开后工具名变了，原来点选的工具对不上
-                            pick: v.pick?.kind === 'tool' ? undefined : v.pick,
-                            page: v.pick?.kind === 'tool' ? 0 : v.page,
-                          }))
-                        }
-                      />
-                    }
-                  >
-                    {rankList('tool', v => fmtTokens(v), it => `×${it.subCount}`)}
-                  </Section>
-                </Box>
-                <Box flexDirection="column" flexGrow={1} minWidth={30}>
-                  <Section
-                    title="技能"
-                    stat={
-                      installedSkills.length > 0
-                        ? `已用 ${ranks.skill.size} / 已装 ${installedSkills.length}`
-                        : skillTotalCalls > 0
-                          ? `${ranks.skill.size} 项 · ${skillTotalCalls} 次`
-                          : undefined
-                    }
-                  >
-                    <Box flexDirection="column" gap={2}>
-                      {rankList('skill', count)}
-                      {unusedSkills.length > 0 ? (
-                        <Text dimColor size="footnote">
-                          这段时间未使用（{unusedSkills.length} 个，常驻系统提示词）：
-                          {unusedSkills.slice(0, 12).join('、')}
-                          {unusedSkills.length > 12 ? ` 等 ${unusedSkills.length} 个` : ''}
-                        </Text>
-                      ) : null}
-                    </Box>
-                  </Section>
-                </Box>
-              </Box>
-            </Box>
-          ) : null}
+          )}
+          <Text dimColor size="footnote" tabular>
+            ┄ 日均 {fmtTokens(avgTokens)}
+            {'    '}— 今天 {fmtTokens(series[series.length - 1]?.tokens ?? 0)}
+          </Text>
         </Box>
 
-        {/* 会话 */}
-        <Section
-          title="会话"
-          note={
-            activeProject && activePick
-              ? `${sorted.length} 个 · 项目「${activeProject}」且用过${RANK_NOUN[activePick.kind]}「${activePick.key}」`
-              : activePick
-                ? `${sorted.length} 个用过${RANK_NOUN[activePick.kind]}「${activePick.key}」`
-                : activeProject
-                  ? `${sorted.length} 个 · 项目「${activeProject}」· 双击查看上下文`
-                  : active.length > 0
-                    ? `${active.length} 个 · 双击查看会话的上下文`
-                    : undefined
-          }
-          right={
+        {/* 4. 构成：类型 / 模型 / 账号切换 */}
+        {tokenTotal > 0 ? (
+          <Box flexDirection="column" gap={1}>
             <Box flexDirection="row" columnGap={1}>
-              {SORTS.map(([s, label]) => (
+              {breakdownTabs.map(([k, label]) => (
                 <Button
-                  key={`sort-${s}`}
+                  key={`breakdown-${k}`}
                   label={label}
                   plain
-                  dimColor={view.sort !== s}
-                  onPress={() => setView(v => ({ ...v, sort: s, page: 0 }))}
+                  dimColor={breakdown !== k}
+                  onPress={() => setView(v => ({ ...v, breakdown: k }))}
                 />
               ))}
             </Box>
-          }
-        >
-          {/* 项目分组胶囊：至少两个项目或已选中项目时显示，与「项目」排行联动 */}
-          {projChips.length >= 2 || activeProject !== undefined ? (
-            <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
-              <Button
-                key="proj-all"
-                label={`全部 ${active.length}`}
-                variant={activeProject === undefined ? 'primary' : 'secondary'}
-                onPress={() =>
-                  setView(v => ({
-                    ...v,
-                    project: undefined,
-                    pick: v.pick?.kind === 'proj' ? undefined : v.pick,
-                    page: 0,
-                  }))
-                }
-              />
-              {projChips.map(p => (
-                <Button
-                  key={`proj-${p.name}`}
-                  label={`${p.name} ${p.count}`}
-                  variant={activeProject === p.name ? 'primary' : 'secondary'}
-                  onPress={() =>
-                    setView(v => ({
-                      ...v,
-                      project: activeProject === p.name ? undefined : p.name,
-                      pick: v.pick?.kind === 'proj' ? undefined : v.pick,
-                      page: 0,
-                    }))
-                  }
-                />
-              ))}
-            </Box>
-          ) : null}
-          {activePick ? (
-            <Button
-              key="clear-pick"
-              label={`✕ 清除筛选（${RANK_NOUN[activePick.kind]}：${activePick.key}）`}
-              plain
-              dimColor
-              onPress={() => setView(v => ({ ...v, pick: undefined, page: 0 }))}
-            />
-          ) : null}
-          {active.length === 0 ? (
-            <Text dimColor>{scan.isRunning ? '正在扫描…' : '这段时间没有会话。'}</Text>
-          ) : (activeProject !== undefined || activePick !== undefined) && sorted.length === 0 ? (
-            <Text dimColor>这段时间没有符合筛选条件的会话。</Text>
-          ) : null}
-          <Box flexDirection="column" gap={1}>
-            {shownSessions.map(s => (
-              <Box key={`s-${s.id}`} flexDirection="row" columnGap={3}>
-                {/* 左：标题与说明；右：成本在上、token 在下，两列各自右对齐 */}
-                <Box flexDirection="column" flexGrow={1}>
-                  {/* 标题即入口：双击进入该会话的上下文 */}
-                  <Button key={`open-${s.id}`} plain onPress={() => void pressSession($, s.id, mainFiles.get(s.id))}>
-                    <Text wrap="truncate-end" weight="medium">
-                      {s.title}
-                    </Text>
-                    {s.id === currentSessionId ? <Text color={ACCENT}> · 当前</Text> : null}
-                  </Button>
-                  <Box flexDirection="row" columnGap={2} alignItems="center">
-                    <Text dimColor size="footnote" wrap="truncate-end">
-                      {view.account === undefined && accountIds.length > 1
-                        ? `${accountLabel(accounts, s.account).replace('（当前）', '').replace(/@.*/, '')} · `
-                        : ''}
-                      {s.project} · {fmtAgo(now - s.lastAt)} · {s.r.prompts} 次提问
-                    </Text>
-                    <Button
-                      key={`copy-${s.id}`}
-                      label="复制恢复命令"
-                      plain
-                      dimColor
-                      onPress={() => void $.ui.copy({ text: `claude --resume ${s.id}`, surface: e.surface })}
-                    />
-                  </Box>
-                </Box>
-                <Box flexDirection="column" alignItems="flex-end" minWidth={12}>
-                  <Text tabular weight="semibold">
-                    {s.costUsd === undefined ? '—' : `${s.isEstimated ? '≈ ' : ''}${fmtUsd(s.r.usd)}`}
-                  </Text>
-                  <Text tabular dimColor size="footnote">
-                    {fmtTokens(tokensOf(s.r))} token
-                  </Text>
-                </Box>
-              </Box>
-            ))}
+            {breakdownTable(
+              breakdown,
+              (breakdown === 'model' ? modelRows : breakdown === 'account' ? accountRows : typeRows).slice(0, BREAKDOWN_MAX),
+              breakdownSlots,
+            )}
           </Box>
-          {totalPages > 1 ? (
-            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
-              <Button
-                key="page-prev"
-                label="‹ 上一页"
-                plain
-                dimColor={page === 0}
-                onPress={() => {
-                  if (page > 0) setView(v => ({ ...v, page: page - 1 }))
-                }}
-              />
-              <Text dimColor size="footnote" tabular>
-                第 {page + 1} / {totalPages} 页 · 共 {sorted.length} 个
-              </Text>
-              <Button
-                key="page-next"
-                label="下一页 ›"
-                plain
-                dimColor={page >= totalPages - 1}
-                onPress={() => {
-                  if (page < totalPages - 1) setView(v => ({ ...v, page: page + 1 }))
-                }}
-              />
-            </Box>
-          ) : null}
-        </Section>
-
-        {/* 钱花在哪 + 每日成本：宽屏双列并排，窄屏自动单列 */}
-        {isWideCharts ? (
-          <Box flexDirection="row" columnGap={3}>
-            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
-              {costBreakdownCard}
-            </Box>
-            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
-              {dailyCostCard}
-            </Box>
-          </Box>
-        ) : (
-          <Box flexDirection="column" gap={4}>
-            {costBreakdownCard}
-            {dailyCostCard}
-          </Box>
-        )}
-
-        {/* 账号 + 活跃度热力图：多账号且宽屏时双列并排 */}
-        {isWideCharts && showAccounts ? (
-          <Box flexDirection="row" columnGap={3}>
-            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
-              {accountsCard}
-            </Box>
-            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
-              {heatmapCard}
-            </Box>
-          </Box>
-        ) : (
-          <Box flexDirection="column" gap={4}>
-            {accountsCard}
-            {heatmapCard}
-          </Box>
-        )}
-
-        <Text dimColor size="caption">
-          等价 API 成本＝这些用量按 API 标价折算的价值；订阅用户不按它计费，真正的上限看订阅额度。
-          取各会话日志记录的总成本，按标价比例分摊到每天和每一类；进行中的会话按同模型已结束会话的单价估算，标「≈」
-          {unpriced > 0 ? `；${unpriced} 个会话无法估价` : ''}。数据来自本机 ~/.claude/projects。
+        ) : null}
+        <Text dimColor size="footnote">
+          token 来自本地会话记录{showMoney ? '；金额按 API 标价折算，仅供参考，不是账单' : ''}
+          {showMoney && unpriced > 0 ? `（${unpriced} 个会话无法估价）` : ''}。点模型或账号可筛选会话。
         </Text>
-      </Box>
+      </Section>
     )
-}
 
-/**
- * 双击非当前会话后看到的上下文：从它的日志还原。
- * 窗口里各类内容的构成（系统提示词、工具定义……）只有运行中的会话才拿得到，这里不显示。
- */
-export async function renderSessionDetail($: EngineInterface, e: PaneInput, id: string): Promise<JSX.Element> {
-  const els = $.ui.resolve(e)
-  const { Box, Text, Button } = els
-  const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
-  const card = cardStyle(e.surface)
-  const aggs = await getSessions($)
-  const accounts = await getAccounts($)
-  const detail = await getDetail($)
-  const scan = await getScan($)
-  const view = await getView($)
-  const now = await $.clock.now()
-  const tzMin = scan.tzMin ?? -new Date().getTimezoneOffset()
-  const cols = e.props.bodyColumns
-  const { full } = paneWidths(cols)
-  const setView = (fn: (v: InsightView) => InsightView) => void setViewState($, fn)
+    /** 工具栏右侧的日期范围：起 → 今天 */
+    const spanDays = view.range === 'today' ? 1 : view.range === '7d' ? 7 : view.range === '30d' ? 30 : 0
+    const rangeSpan = spanDays === 0 ? '全部' : spanDays === 1 ? dayKey(now, tzMin) : `${dayKey(now - (spanDays - 1) * DAY_MS, tzMin)} → ${dayKey(now, tzMin)}`
 
-  const all = mergeSessions(aggs)
-  const s = all.find(x => x.id === id)
-  const file = aggs.find(a => a.id === id && !a.isSub)?.file
-  // 面板重载后状态还在、但详情可能是别的会话的：补发一次加载
-  if ((detail === null || detail.id !== id) && file && requestedDetail !== id) {
-    requestedDetail = id
-    void loadSessionDetail($, id, file)
-  }
-  const d = detail && detail.id === id ? detail : undefined
-  const totals = s ? addSession(emptyTotals(), s, undefined) : undefined
-  const prompted = totals ? totals.in + totals.cr + totals.cw : 0
-  const account = accounts.bySession[id]
-  const firstDay = s ? Object.keys(s.days).sort()[0] : undefined
-  // 历史会话不知道当时的窗口大小：超过 200k 说明是 1M 窗口
-  const window = d && d.maxCtx > 200_000 ? 1_000_000 : 200_000
-
-  const Section = (props: { title: string; note?: string; right?: JSX.Element | null; children?: unknown }) => (
-    <Box flexDirection="column" gap={1} {...card}>
-      <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
-        <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1}>
-          <Text weight="semibold">{props.title}</Text>
-          {props.note ? (
-            <Text dimColor size="footnote">
-              {props.note}
-            </Text>
-          ) : null}
-        </Box>
-        {props.right ?? null}
-      </Box>
-      {props.children as JSX.Element}
-    </Box>
-  )
-  const stat = (label: string, value: string) => (
-    <Box flexDirection="column" minWidth={10}>
-      <Text dimColor size="caption">
-        {label}
-      </Text>
-      <Text weight="semibold" tabular>
-        {value}
-      </Text>
-    </Box>
-  )
-
-  if (!s) {
-    return (
-      <Box flexDirection="column" paddingX={1} paddingY={1}>
-        <Text dimColor>找不到这个会话的日志，可能已被删除。</Text>
-      </Box>
-    )
-  }
-
-  const pctLoaded = d && d.totalBytes > 0 ? Math.round((d.doneBytes / d.totalBytes) * 100) : 0
-  const trend = d ? d.requests.map(r => r.ctx) : []
-  const trendSvg = Svg && d && d.status === 'ready' && trend.length >= 2 ? contextTrendSvg(trend, window, undefined, full) : undefined
-  const trendSize = trendSvg ? svgSize(trendSvg) : undefined
-  const drops = d?.drops ?? []
-  const fileFilter: FileFilter = view.fileFilter ?? 'all'
-  const allFileEntries = d ? Object.entries(d.files) : []
-  const readFileCount = allFileEntries.filter(([, f]) => f.r > 0).length
-  const writeFileCount = allFileEntries.filter(([, f]) => f.w > 0).length
-  const filteredFiles = d ? filterFiles(d.files, fileFilter) : []
-  const FILES_VISIBLE = 6
-  const FILES_MAX = 30
-  const shownFiles = view.showAllFiles ? filteredFiles.slice(0, FILES_MAX) : filteredFiles.slice(0, FILES_VISIBLE)
-  const fileFilters: [FileFilter, string][] = [
-    ['all', `全部 ${allFileEntries.length}`],
-    ['read', `读 ${readFileCount}`],
-    ['write', `写 ${writeFileCount}`],
-  ]
-
-  return (
-    <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
-      {/* 标题 */}
-      <Box flexDirection="column">
-        <Text size="heading" weight="semibold" wrap="truncate-end">
-          {s.title}
-        </Text>
-        <Text dimColor size="footnote" wrap="truncate-end">
-          {account ? `${accountLabel(accounts, account).replace('（当前）', '')} · ` : ''}
-          {s.project}
-          {firstDay ? ` · ${firstDay} 开始` : ''} · 最近 {fmtAgo(now - s.lastAt)}
-          {d?.model ? ` · ${d.model}` : ''}
-        </Text>
-      </Box>
-
-      {/* 上下文 */}
-      {!file ? (
-        // 主日志已被删、只剩子 Agent 日志：没有可还原的上下文，不能一直停在「读取中」
-        <Box flexDirection="column" {...card}>
-          <Text dimColor>主会话日志已不存在，无法还原上下文，下方只有子 Agent 的用量。</Text>
-        </Box>
-      ) : !d || d.status === 'loading' ? (
-        <Box flexDirection="column" {...card}>
-          <Text dimColor>正在读取会话日志 {pctLoaded}%…</Text>
-        </Box>
-      ) : d.status === 'error' ? (
-        <Box flexDirection="column" {...card}>
-          <Text color={ORANGE}>读取失败：{d.error}</Text>
-        </Box>
-      ) : (
-        <Box flexDirection="column" gap={1} {...card}>
-          <Box flexDirection="row" justifyContent="space-between" alignItems="flex-end" columnGap={2}>
-            <Text size="heading" weight="medium" tabular>
-              最后上下文 {pct(d.lastCtx, window)}
-            </Text>
-            <Text dimColor tabular>
-              {fmtTokens(d.lastCtx)} / {fmtTokens(window)}
-            </Text>
-          </Box>
-          {Svg ? (
-            <Svg
-              source={stackSvg(
-                [
-                  { name: '最后上下文', value: d.lastCtx, color: ACCENT, note: fmtTokens(d.lastCtx) },
-                  { name: '剩余', value: Math.max(0, window - d.lastCtx), color: 'track' },
-                ],
-                full,
-              )}
-              alt="最后一次请求的上下文占用"
-              width={full}
-              height={Math.ceil(10 * 1.04) + 2}
-              isInteractive
-            />
-          ) : (
-            <Text color={ACCENT}>{textBar((d.lastCtx / window) * 100, Math.max(10, Math.min(40, cols - 4)))}</Text>
-          )}
+    // ----- 设置页 -----
+    const settingsPage = tab === 'settings' ? await renderSettings() : null
+    async function renderSettings(): Promise<JSX.Element> {
+      const claudeDir = (await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)) || '~/.claude'
+      const saveSettings = (fn: (v: InsightSettings) => InsightSettings) => void setSettings($, fn)
+      const countBy = new Map<string, number>()
+      for (const s of everything) countBy.set(s.account ?? 'none', (countBy.get(s.account ?? 'none') ?? 0) + 1)
+      // 项目：最近活跃的在前，已排除的总会列出
+      const projectLast = new Map<string, number>()
+      for (const s of everything) projectLast.set(s.project, Math.max(projectLast.get(s.project) ?? 0, s.lastAt))
+      const projects = [...projectLast.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k)
+      const shownProjects = [
+        ...projects.slice(0, SETTINGS_PROJECTS),
+        ...projects.slice(SETTINGS_PROJECTS).filter(p => excluded.has(p)),
+      ]
+      const group = (title: string) => (
+        <Box key={`set-h-${title}`} paddingTop={1}>
           <Text dimColor size="footnote">
-            峰值 {fmtTokens(d.maxCtx)} · {d.requestCount} 次请求 · 上下文骤降（压缩或清空）{d.compactions} 次 · 窗口按{' '}
-            {fmtTokens(window)} 估算
+            {title}
           </Text>
         </Box>
-      )}
+      )
+      const row = (key: string, name: string, note: string | undefined, right?: JSX.Element | null) => (
+        <Box key={`set-${key}`} flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={3}>
+          <Box flexDirection="column" flexShrink={1} minWidth={0}>
+            <Text wrap="truncate-end">{name}</Text>
+            {note ? (
+              <Text dimColor size="footnote" wrap="truncate-end">
+                {note}
+              </Text>
+            ) : null}
+          </Box>
+          {right ?? null}
+        </Box>
+      )
+      const toggle = (key: string, on: boolean, onPress: () => void, onLabel = '开', offLabel = '关') => (
+        <Button key={`set-tg-${key}`} label={on ? onLabel : offLabel} variant={on ? 'primary' : 'secondary'} onPress={onPress} />
+      )
+      return (
+        <Section title="插件设置" stat="修改即时生效">
+          {group('数据来源')}
+          {row('logs', '会话日志', `${claudeDir}/projects · 自动检测 · ${everything.length} 个会话`)}
+          {row('index', '账号索引', `Claude Desktop 的 claude-code-sessions · 只读，用于标注会话所属账号 · 已识别 ${accountIds.length} 个账号`)}
 
-      {/* 趋势 */}
-      {d && d.status === 'ready' && trend.length >= 2 ? (
-        <Section
-          title="上下文趋势"
-          note={`${d.requestCount} 次请求${d.requestCount > d.requests.length ? `，抽样 ${d.requests.length} 个点` : ''}`}
-        >
-          {Svg && trendSvg && trendSize ? (
-            <Svg
-              source={trendSvg}
-              alt="逐请求上下文大小"
-              width={trendSize.width}
-              height={Math.ceil(trendSize.height * 1.04) + 2}
-              isInteractive
-            />
-          ) : (
-            <Text color={ACCENT}>{sparkline(trend.slice(-Math.max(10, cols - 4)), window)}</Text>
+          {group('账号显示名')}
+          {accountIds.map(id => {
+            const l = storedAccounts.labels[id]
+            const email = l?.email ?? l?.name ?? `账号 ${id.slice(0, 4)}`
+            return row(
+              `acct-${id}`,
+              email,
+              `${id === accounts.current ? '当前账号 · ' : ''}${countBy.get(id) ?? 0} 个会话`,
+              <Input
+                key={`alias-${id}`}
+                placeholder="显示名"
+                value={settings.aliases?.[id] ?? ''}
+                submitLabel="保存"
+                onSubmit={value => saveSettings(v => ({ ...v, aliases: { ...v.aliases, [id]: value.trim() } }))}
+              />,
+            )
+          })}
+          {countBy.get('none')
+            ? row('acct-none', '未归属', `${countBy.get('none')} 个会话 · 在终端直接运行的 CLI 会话不在 Desktop 索引里`)
+            : null}
+
+          {group('排除项目')}
+          {shownProjects.map(p =>
+            row(
+              `proj-${p}`,
+              p,
+              undefined,
+              toggle(
+                `proj-${p}`,
+                excluded.has(p),
+                () =>
+                  saveSettings(v => {
+                    const set = new Set(v.excluded ?? [])
+                    if (set.has(p)) set.delete(p)
+                    else set.add(p)
+                    return { ...v, excluded: [...set] }
+                  }),
+                '已排除',
+                '统计中',
+              ),
+            ),
           )}
-        </Section>
-      ) : null}
+          {projects.length > shownProjects.length ? (
+            <Text dimColor size="footnote">
+              只列出最近活跃的 {SETTINGS_PROJECTS} 个项目
+            </Text>
+          ) : null}
 
-      {/* 上下文事件（骤降明细） */}
-      {d && d.status === 'ready' && drops.length > 0 ? (
-        <Section
-          title="上下文事件"
-          note={`压缩或清空 · 共 ${drops.length} 次${drops.length > 10 ? '（显示最近 10 次）' : ''}`}
-        >
-          <Box flexDirection="column" gap={1}>
-            {drops
-              .slice(-10)
-              .reverse()
-              .map(ev => (
-                <Box key={`drop-${ev.step}-${ev.at}`} flexDirection="row" justifyContent="space-between" columnGap={2}>
-                  <Text dimColor size="footnote" tabular>
-                    第 {ev.step} 次请求 · {fmtClockTime(ev.at, tzMin)}
-                  </Text>
-                  <Text tabular size="footnote">
-                    <Text dimColor>{fmtTokens(ev.from)} → </Text>
-                    <Text color={ORANGE} weight="medium">
-                      {fmtTokens(ev.to)}
-                    </Text>
-                    <Text dimColor>（-{pct(ev.from - ev.to, ev.from)}）</Text>
-                  </Text>
+          {group('显示')}
+          {row(
+            'money',
+            '显示金额',
+            '关闭后隐藏所有「≈ $」等价成本',
+            toggle('money', showMoney, () => saveSettings(v => ({ ...v, showMoney: !(v.showMoney !== false) }))),
+          )}
+
+          {group('维护')}
+          {row(
+            'rescan',
+            '重新扫描',
+            scan.isRunning ? `扫描中 ${pctDone}%` : `已读取 ${scan.totalFiles} 个日志文件`,
+            <Button key="rescan" label="重新扫描" variant="secondary" onPress={() => void runScan($)} />,
+          )}
+
+          {group('关于数据')}
+          <Text dimColor size="footnote">
+            token 来自本机会话记录（jsonl），按每条消息的 usage 字段累计，是准确值。金额按各模型 API 标价折算，订阅用户不按它计费，仅供参考。会话所属账号来自
+            Claude Desktop 的会话索引，不在索引里的记为「未归属」。订阅额度读取自 Claude 客户端，非当前账号显示最后一次读数。所有数据只在本机计算，不上传。
+          </Text>
+        </Section>
+      )
+    }
+
+    // 按下后焦点环会停在这个按钮上，宿主又会「保持焦点可见」：往下滚走后被拉回，就是抖动。
+    // 所以每次按下都给按钮换个 key（fk），原来的元素消失，焦点环不再钉在滚出视野的按钮上
+    const fk = (k: string) => `${k}${(view.focusEpoch ?? 0) % 2 === 1 ? '~' : ''}`
+    const bump = (v: InsightView) => (v.focusEpoch ?? 0) + 1
+    // 每个会话一张带边框的小卡片：上下内边距收紧，不比项目头的大卡片抢眼
+    const rowCard = e.surface === 'terminal' ? card : ({ ...card, paddingY: 'xs' } as const)
+    /** 一个会话行：两行。第 1 行标题与标签，右侧时间；第 2 行账号 · token · 最后一条消息（窄档没有最后消息，改放时间） */
+    const renderSessionRow = (s: (typeof sorted)[number]) => {
+      const acctName =
+        view.account === undefined && accountIds.length > 1 && s.account !== undefined ? (
+          <Text color={acctColor(s.account)}>
+            {accountLabel(accounts, s.account).replace('（当前）', '').replace(/@.*/, '')}
+            <Text dimColor> · </Text>
+          </Text>
+        ) : null
+      // 终端里恢复必须在会话所在目录下才找得到它，所以带上 cd
+      const resumeCmd = `${s.cwd ? `cd ${shellQuote(s.cwd)} && ` : ''}claude --resume ${s.id}`
+      // 在 Claude Desktop 里开的会话直接打开；Desktop 只打得开当前登录账号的会话，其余（他号、纯终端会话、终端界面）复制恢复命令
+      const desktopId = accounts.desktopBySession?.[s.id]
+      const isOwnAccount = s.account !== undefined && s.account === accounts.current
+      const canOpen = desktopId !== undefined && isOwnAccount && e.surface !== 'terminal'
+      const archived = accounts.desktopMeta?.[s.id]?.isArchived === true
+      // 标题就是这一行唯一的可聚焦主操作：点击面积大，长列表里的控件也少
+      // （按钮越多，宿主「保持焦点可见」的自动滚动越容易和用户滚动抢位置）
+      const act = async () => {
+        // 按下后换 key，让焦点环离开这个按钮（见 fk）
+        await setViewState($, v => ({ ...v, focusEpoch: bump(v) }))
+        if (canOpen) {
+          await openInDesktop($, `claude://claude.ai/epitaxy/${desktopId}`, e.surface, archived)
+        } else {
+          await $.ui.copy({ text: resumeCmd, surface: e.surface })
+          $.ui.toast(`已复制恢复命令：${resumeCmd}`, { timeoutMs: 6000 })
+        }
+      }
+      // 默认行为（打开）不提示；只有「点了是复制命令」的例外才标出来。终端里全都是复制，由模块标题旁的一句话说明
+      const showCopyHint = !canOpen && e.surface !== 'terminal'
+      // 标签放在按钮外面：按钮里的文字字号、颜色会被宿主统一覆盖，标签就和标题混成一串了
+      const title = (
+        <Box flexDirection="row" alignItems="center" columnGap={1} minWidth={0}>
+          <Box flexShrink={1} minWidth={0}>
+            <Button key={fk(`open-${s.id}`)} plain onPress={() => void act()}>
+              <Text wrap="truncate-end" weight="medium">
+                {s.title}
+              </Text>
+            </Button>
+          </Box>
+          {s.id === currentSessionId ? (
+            <Text color={ACCENT} size="footnote">
+              当前
+            </Text>
+          ) : null}
+          {archived ? (
+            <Text dimColor size="footnote">
+              已归档
+            </Text>
+          ) : null}
+          {showCopyHint ? (
+            <Text dimColor size="footnote">
+              复制命令
+            </Text>
+          ) : null}
+        </Box>
+      )
+      const ago = fmtAgo(now - s.lastAt)
+      const tokens = `${fmtTokens(tokensOf(s.r))} token`
+      return (
+        <Box key={`s-${s.id}`} flexDirection="column" {...rowCard}>
+          <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={2}>
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              {title}
+            </Box>
+            {isNarrow ? null : (
+              <Text dimColor size="footnote" tabular>
+                {ago}
+              </Text>
+            )}
+          </Box>
+          {/* 左边留出和标题按钮内边距相同的一段，两行才对得齐 */}
+          <Box paddingLeft="xs">
+            <Text size="footnote" wrap="truncate-end">
+              {acctName}
+              <Text dimColor>
+                {isNarrow ? `${ago} · ${tokens}` : tokens}
+                {!isNarrow && s.lastPrompt && s.hasTitle ? ` · ${s.lastPrompt}` : ''}
+              </Text>
+            </Text>
+          </Box>
+        </Box>
+      )
+    }
+
+    // ----- 版面 -----
+    const tree = (
+      <Box flexDirection="column" gap={4} paddingX={1} paddingY={1}>
+        {/* 工具栏：左边设置与账号，右边日期范围与时间段 */}
+        <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" rowGap={1} columnGap={2}>
+          <Box flexDirection="row" columnGap={1} alignItems="center">
+            <Button
+              key="open-settings"
+              label={tab === 'settings' ? '‹ 返回' : '插件设置'}
+              variant="secondary"
+              onPress={() => setView(v => ({ ...v, tab: v.tab === 'settings' ? 'overview' : 'settings' }))}
+            />
+            {accountIds.length > 0 && tab !== 'settings' ? (
+              <Select
+                key="account"
+                options={accountOptions}
+                value={view.account ?? 'all'}
+                onSelect={value => setView(v => ({ ...v, account: value === 'all' ? undefined : value, page: 0 }))}
+              />
+            ) : null}
+            {scan.isRunning ? (
+              <Text dimColor size="footnote" tabular>
+                扫描中 {pctDone}%
+              </Text>
+            ) : null}
+          </Box>
+          {tab === 'settings' ? null : (
+            <Box flexDirection="row" columnGap={2} alignItems="center">
+              {isNarrow ? null : (
+                <Text dimColor size="footnote" tabular>
+                  {rangeSpan}
+                </Text>
+              )}
+              <Box flexDirection="row" columnGap={1}>
+                {RANGES.map(([r, label]) => (
+                  <Button
+                    key={`range-${r}`}
+                    label={label}
+                    variant={view.range === r ? 'primary' : 'secondary'}
+                    onPress={() => setView(v => ({ ...v, range: r, page: 0 }))}
+                  />
+                ))}
+              </Box>
+            </Box>
+          )}
+        </Box>
+
+        {scan.error ? <Text color="error">扫描出错：{scan.error}</Text> : null}
+
+        {/* 一整页，与原型一致：额度 → 用量 → 工具 → 会话；设置页单独一页 */}
+        {tab !== 'settings' ? (
+          <Box flexDirection="column" gap={4}>
+            {/* 订阅额度：重度用户最关心会不会撞上限 */}
+            <Section
+              title="订阅额度"
+              note={
+                shownLimits.length === 0
+                  ? view.account === 'none'
+                    ? '未归属的会话没有对应账号的额度'
+                    : '发一条消息后显示'
+                  : undefined
+              }
+              stat={shownLimits[0]?.isLive ? '实时' : undefined}
+            >
+              {quotaRows.map((row, ri) => (
+                <Box key={`quota-row-${ri}`} flexDirection="row" columnGap={4}>
+                  {row.map(r => (
+                    <Box
+                      key={`quota-${r.account}`}
+                      flexDirection="column"
+                      gap={1}
+                      width={quotaCols === 2 ? '50%' : '100%'}
+                      flexGrow={1}
+                      flexShrink={1}
+                      minWidth={0}
+                    >
+                      {limitRows.length > 1 || !r.isLive ? (
+                        <Text dimColor size="footnote" wrap="truncate-end">
+                          {accountLabel(accounts, r.account === 'current' ? undefined : r.account).replace('未归属', '当前账号')}
+                          {r.isLive ? '' : ` · ${fmtAgo(now - r.at)}的读数`}
+                        </Text>
+                      ) : null}
+                      {r.windows.map(w => quotaRow(`q-${r.account}-${w.kind}`, w, quotaBarWidth, !r.isLive))}
+                    </Box>
+                  ))}
+                  {/* 奇数个账号时补一个空位，保持两列对齐 */}
+                  {row.length < quotaCols ? <Box key={`quota-pad-${ri}`} width="50%" flexGrow={1} flexShrink={1} minWidth={0} /> : null}
                 </Box>
               ))}
-          </Box>
-        </Section>
-      ) : null}
+            </Section>
 
-      {/* 用量 */}
-      {totals ? (
-        <Section title="用量">
-          <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={1}>
-            {stat('等价 API 成本', s.costUsd === undefined ? '—' : `${s.isEstimated ? '≈ ' : ''}${fmtUsd(totals.usd)}`)}
-            {stat('Token 消耗', fmtTokens(tokensOf(totals)))}
-            {stat('提问', String(totals.prompts))}
-            {stat('缓存命中', pct(totals.cr, prompted))}
-            {stat('输出', fmtTokens(totals.out))}
-          </Box>
-        </Section>
-      ) : null}
+            {/* 花费：总数、每天、花在哪 */}
+            {spendCard}
 
-      {/* 活动 */}
-      {d && d.status === 'ready' && Object.keys(d.tools).length > 0 ? (
-        <Section title="活动" note={`主会话 ${Object.values(d.tools).reduce((a, b) => a + b, 0)} 次工具调用（不含子 Agent）`}>
-          <Text>
-            {topEntries(groupTools(d.tools), 5)
-              .map(([k, v]) => `${k} ${v}`)
-              .join(' · ')}
-          </Text>
-          {allFileEntries.length > 0 ? (
-            <Box flexDirection="column" gap={1}>
-              <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={2}>
-                <Text dimColor size="footnote">
-                  文件活动
-                </Text>
-                <Box flexDirection="row" columnGap={1}>
-                  {fileFilters.map(([fk, label]) => (
-                    <Button
-                      key={`dfile-filter-${fk}`}
-                      label={label}
-                      plain
-                      dimColor={fileFilter !== fk}
-                      onPress={() => setView(v => ({ ...v, fileFilter: fk, showAllFiles: false }))}
-                    />
-                  ))}
-                </Box>
-              </Box>
-              {shownFiles.length === 0 ? (
-                <Text dimColor size="footnote">
-                  没有符合条件的文件。
-                </Text>
-              ) : (
-                <Box flexDirection="column">
-                  {shownFiles.map(([p, f]) => (
-                    <Box key={`dfile-${p}`} flexDirection="row" justifyContent="space-between" columnGap={2}>
-                      <Text wrap="truncate-start">{shortFilePath(p)}</Text>
-                      <Text tabular dimColor>
-                        {[f.r > 0 ? `读 ${f.r}` : '', f.w > 0 ? `写 ${f.w}` : ''].filter(Boolean).join(' · ')}
-                      </Text>
+            {/* 上下文被谁占了 */}
+            {toolCard}
+
+            {/* 会话：以项目为主线，项目一行（会话数 · 最近活动 · 成本与占比），展开后列出它的会话 */}
+            <Section
+              title="会话"
+              note={
+                active.length === 0
+                  ? undefined
+                  : activePick
+                    ? `${groups.length} 个项目 · ${sorted.length} 个会话用过${RANK_NOUN[activePick.kind]}「${pickLabel}」`
+                    : `${groups.length} 个项目 · ${sorted.length} 个会话${e.surface === 'terminal' ? ' · 点击会话复制恢复命令' : ''}`
+              }
+            >
+              {/* 账号图例：色点对应哪个账号；点一下只看该账号。只有多个账号且在「全部」视图时显示 */}
+              {accountIds.length > 1 && view.account === undefined ? (
+                <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={0} alignItems="center">
+                  <Text dimColor size="footnote">
+                    账号
+                  </Text>
+                  {accountIds.map(id => (
+                    // 色点放在按钮外面：按钮里的文字颜色会被宿主覆盖成统一的前景色，圆点就变白了
+                    <Box key={`acct-${id}`} flexDirection="row" alignItems="center" columnGap={1}>
+                      <Text color={acctColor(id)}>●</Text>
+                      <Button
+                        key={`acct-btn-${id}`}
+                        label={accountLabel(accounts, id)}
+                        plain
+                        onPress={() => setView(v => ({ ...v, account: id, page: 0 }))}
+                      />
                     </Box>
                   ))}
                 </Box>
-              )}
-              {filteredFiles.length > FILES_VISIBLE ? (
+              ) : null}
+              {/* 工具行：左边搜索，右边排序（输入框宽度由宿主决定，和排序同排更自然） */}
+              <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={3} rowGap={1}>
+                {active.length > 0 ? (
+                  <Input
+                    key="session-search"
+                    placeholder="搜索会话"
+                    value={view.query ?? ''}
+                    submitLabel="搜索"
+                    onInput={value => setView(v => ({ ...v, query: value.trim() ? value : undefined, page: 0, sessionPage: 0, openProjects: undefined }))}
+                    onSubmit={value => setView(v => ({ ...v, query: value.trim() ? value : undefined, page: 0, sessionPage: 0, openProjects: undefined }))}
+                  />
+                ) : (
+                  <Box />
+                )}
+                <Box flexDirection="row" columnGap={1}>
+                  {SORTS.map(([st, label]) => (
+                    <Button
+                      key={`sort-${st}`}
+                      label={label}
+                      plain
+                      dimColor={sortMode !== st}
+                      onPress={() => setView(v => ({ ...v, sort: st, page: 0, sessionPage: 0 }))}
+                    />
+                  ))}
+                </Box>
+              </Box>
+              {activePick ? (
                 <Button
-                  key="dfile-more"
-                  label={
-                    view.showAllFiles
-                      ? filteredFiles.length > FILES_MAX
-                        ? `收起（已显示前 ${FILES_MAX} 个，共 ${filteredFiles.length} 个）`
-                        : '收起'
-                      : filteredFiles.length > FILES_MAX
-                        ? `显示前 ${FILES_MAX} 个（共 ${filteredFiles.length} 个）`
-                        : `显示全部 ${filteredFiles.length} 个`
-                  }
+                  key="clear-pick"
+                  label={`✕ 清除筛选（${RANK_NOUN[activePick.kind]}：${pickLabel}）`}
                   plain
                   dimColor
-                  onPress={() => setView(v => ({ ...v, showAllFiles: !v.showAllFiles }))}
+                  onPress={() => setView(v => ({ ...v, pick: undefined }))}
                 />
               ) : null}
-            </Box>
-          ) : null}
-          {Object.keys(d.programs).length > 0 ? (
-            <Text dimColor size="footnote">
-              命令：
-              {topEntries(d.programs, 8)
-                .map(([k, v]) => `${k}×${v}`)
-                .join('  ')}
-            </Text>
-          ) : null}
-        </Section>
-      ) : null}
+              {active.length === 0 ? (
+                <Text dimColor>{scan.isRunning ? '正在扫描…' : '这段时间没有会话。'}</Text>
+              ) : isFiltering && sorted.length === 0 ? (
+                <Text dimColor>这段时间没有符合筛选条件的会话。</Text>
+              ) : null}
+              <Box flexDirection="column" gap={1} minHeight={sessionBodyRows} justifyContent="space-between">
+              <Box flexDirection="column" gap={1}>
+                {visibleGroups.map(g => {
+                  const isOpen = isProjectOpen(g.name)
+                  const sessionPages = Math.max(1, Math.ceil(g.sessions.length / SESSIONS_PER_PAGE))
+                  const sessionPage = Math.min(Math.max(0, view.sessionPage ?? 0), sessionPages - 1)
+                  const shown = g.sessions.slice(sessionPage * SESSIONS_PER_PAGE, (sessionPage + 1) * SESSIONS_PER_PAGE)
+                  // 点开一个：其他项目隐藏；再点已展开的收起，回到项目列表（空数组）
+                  // 按下后焦点环会停在这个按钮上，宿主又会「保持焦点可见」：往下滚走后被拉回，就是抖动。
+                  // 所以每次按下都给按钮换个 key（fk），原来的元素消失，焦点环不再钉在滚出视野的按钮上
+                  const toggle = async () => {
+                    await setViewState($, v => ({ ...v, openProjects: isOpen ? [''] : [g.name], sessionPage: 0, focusEpoch: bump(v) }))
+                  }
+                  // 收起时的项目头多给一个小提示：含当前会话
+                  const hasCurrent = g.sessions.some(x => x.id === currentSessionId)
+                  return (
+                    <Box key={`proj-${g.name}`} flexDirection="column" gap={1}>
+                      {/* 项目行：› 名称 ··· 会话数 · 最近活动 ｜ token 消耗 ｜ 占比。克制：不画进度条，靠排版与留白区分层级 */}
+                      <Box flexDirection="row" alignItems="center" columnGap={3}>
+                        <Box flexGrow={1} flexShrink={1} minWidth={0} flexDirection="row" alignItems="center" columnGap={2}>
+                          <Button key={fk(`proj-toggle-${g.name}`)} plain onPress={() => void toggle()}>
+                            <Text wrap="truncate-end" weight={isOpen ? 'semibold' : 'medium'}>
+                              {isOpen ? '‹  ' : '›  '}
+                              {g.name}
+                            </Text>
+                          </Button>
+                          {!isOpen && hasCurrent ? (
+                            <Text color={ACCENT} size="footnote">
+                              含当前
+                            </Text>
+                          ) : null}
+                        </Box>
+                        {isNarrow ? null : (
+                          <Text dimColor size="footnote" tabular>
+                            {g.sessions.length} 个 · {fmtAgo(now - g.lastAt)}
+                          </Text>
+                        )}
+                        <Box minWidth={isNarrow ? 7 : 9} justifyContent="flex-end">
+                          <Text tabular>{fmtTokens(g.tokens)}</Text>
+                        </Box>
+                      </Box>
+                      {isOpen ? (
+                        <Box flexDirection="column" gap={1} paddingTop={1}>
+                          {shown.map(s => renderSessionRow(s))}
+                        </Box>
+                      ) : null}
+                    </Box>
+                  )
+                })}
+              </Box>
+              {/* 会话分页器：固定在模块底部，每一页位置不变 */}
+              {openGroup && openPages > 1 ? (
+                <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
+                  <Button
+                    key={fk(`sess-prev-${openGroup.name}`)}
+                    label="‹ 上一页"
+                    plain
+                    dimColor={openPage === 0}
+                    onPress={() => setView(v => ({ ...v, sessionPage: Math.max(0, openPage - 1), focusEpoch: bump(v) }))}
+                  />
+                  <Text dimColor size="footnote" tabular>
+                    第 {openPage + 1} / {openPages} 页 · 共 {openGroup.sessions.length} 个会话
+                  </Text>
+                  <Button
+                    key={fk(`sess-next-${openGroup.name}`)}
+                    label="下一页 ›"
+                    plain
+                    dimColor={openPage >= openPages - 1}
+                    onPress={() => setView(v => ({ ...v, sessionPage: Math.min(openPages - 1, openPage + 1), focusEpoch: bump(v) }))}
+                  />
+                </Box>
+              ) : null}
+              {projectPages > 1 && openProject === undefined ? (
+                <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={2}>
+                  <Button
+                    key="proj-page-prev"
+                    label="‹ 上一页"
+                    plain
+                    dimColor={projectPage === 0}
+                    onPress={() => setView(v => ({ ...v, page: Math.max(0, projectPage - 1) }))}
+                  />
+                  <Text dimColor size="footnote" tabular>
+                    项目 {projectPage + 1} / {projectPages}
+                  </Text>
+                  <Button
+                    key="proj-page-next"
+                    label="下一页 ›"
+                    plain
+                    dimColor={projectPage >= projectPages - 1}
+                    onPress={() => setView(v => ({ ...v, page: Math.min(projectPages - 1, projectPage + 1) }))}
+                  />
+                </Box>
+              ) : null}
+              </Box>
+            </Section>
+          </Box>
+        ) : null}
 
-      <Text dimColor size="caption">
-        历史会话从日志还原：上下文大小来自每次请求的输入 token；窗口里各类内容的构成只有运行中的会话才拿得到。
-      </Text>
-    </Box>
-  )
+        {settingsPage}
+      </Box>
+    )
+    insightsMemo = { sig, tree }
+    return tree
 }

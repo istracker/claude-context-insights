@@ -5,21 +5,19 @@ import type {
   AccountLabel,
   AccountMap,
   DayAgg,
-  DetailRequest,
   ScanState,
   SessionAgg,
-  SessionDetail,
 } from '../types'
-import { NO_ACCOUNTS, setAccounts, setDetail, setInstalledSkills, setScanState, setSessions } from './state'
-import { addCount, billingWeight, detectContextDrops, programOf } from './util'
+import { NO_ACCOUNTS, setAccounts, setScanState, setSessions } from './state'
+import { addCount, billingWeight } from './util'
 
 export { billingWeight }
 
 const LABELS_KEY = 'account-labels-1'
 const CHUNK = 4 * 1024 * 1024
-const STORE_PREFIX = 'agg5:'
+const STORE_PREFIX = 'agg6:'
 /** 旧版本的缓存前缀，扫描时清掉 */
-const OLD_PREFIXES = ['agg1:', 'agg2:', 'agg3:', 'agg4:']
+const OLD_PREFIXES = ['agg1:', 'agg2:', 'agg3:', 'agg4:', 'agg5:']
 const MAP_CAP = 40
 
 export function emptyAgg(id: string, file: string, isSub: boolean): SessionAgg {
@@ -36,7 +34,7 @@ export function emptyAgg(id: string, file: string, isSub: boolean): SessionAgg {
 }
 
 function emptyDay(): DayAgg {
-  return { in: 0, out: 0, cr: 0, cw: 0, cw1h: 0, req: 0, prompts: 0, models: {}, modelWeight: {}, tools: {}, toolTokens: {}, skills: {} }
+  return { in: 0, out: 0, cr: 0, cw: 0, cw1h: 0, req: 0, prompts: 0, models: {}, modelWeight: {}, tools: {}, toolTokens: {} }
 }
 
 /** 时间戳 → 本地小时 0–23 */
@@ -107,6 +105,7 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
       day.cr += tcr
       day.cw += tcw
       day.cw1h += tcw1h
+      agg.lastCtx = tin + tcr + tcw
       const reqW = billingWeight(tin, tout, tcr, tcw, tcw1h, model)
       agg.weight += reqW
       day.req += 1
@@ -131,10 +130,6 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
       if (tid) {
         agg.pendingTools ??= {}
         agg.pendingTools[tid] = name
-      }
-      if (name === 'Skill') {
-        const skill = str(input?.skill)
-        if (skill) addCount(day.skills, skill)
       }
     }
     return
@@ -181,7 +176,7 @@ export function ingestLine(agg: SessionAgg, line: string, tzMin: number): void {
   }
   if (line.startsWith('{"type":"last-prompt"')) {
     const t = str(parse(line)?.lastPrompt)
-    if (t) agg.lastPrompt = t.slice(0, 80)
+    if (t) agg.lastPrompt = t.replace(/\s+/g, ' ').trim().slice(0, 120)
   }
 }
 
@@ -255,7 +250,6 @@ export async function scanFile(
   for (const d of Object.values(agg.days)) {
     d.tools = capMap(d.tools)
     if (d.toolTokens) d.toolTokens = capMap(d.toolTokens)
-    d.skills = capMap(d.skills)
   }
 }
 
@@ -286,7 +280,7 @@ async function listTargets($: EngineInterface, root: string): Promise<Target[]> 
 }
 
 /** 桌面端 local_*.json 的内存缓存（仅在文件有有效 mtime 时启用，避免重复串行读盘） */
-const desktopSessionCache = new Map<string, { size: number; mtimeMs: number; ids: string[] }>()
+const desktopSessionCache = new Map<string, { size: number; mtimeMs: number; ids: string[]; localId?: string; title?: string; isArchived?: boolean; mainIds: string[] }>()
 
 /**
  * 会话 → 账号。Claude Desktop 把每个 Code 会话记在
@@ -315,6 +309,8 @@ export async function loadAccounts(
   }
 
   const bySession: Record<string, string> = {}
+  const desktopBySession: Record<string, string> = {}
+  const desktopMeta: Record<string, { title?: string; isArchived?: boolean }> = {}
   for (const acct of accts) {
     if (acct.kind !== 'dir') continue
     for (const org of await $.fs.list(`${base}/${acct.name}`).catch(() => [])) {
@@ -325,16 +321,33 @@ export async function loadAccounts(
         const filePath = `${dir}/${f.name}`
         const cached = f.mtimeMs > 0 ? desktopSessionCache.get(filePath) : undefined
         let ids: string[]
+        let localId: string | undefined
+        let title: string | undefined
+        let isArchived: boolean | undefined
+        let mainIds: string[]
         if (cached && cached.size === f.size && cached.mtimeMs === f.mtimeMs) {
           ids = cached.ids
+          localId = cached.localId
+          title = cached.title
+          isArchived = cached.isArchived
+          mainIds = cached.mainIds
         } else {
           const d = parse(await $.fs.read(filePath).catch(() => ''))
           // 桌面会话回退/重来后会换新的 CLI 会话 id，旧 id 记在 priorCliSessionIds
           const prior = Array.isArray(d?.priorCliSessionIds) ? d.priorCliSessionIds : []
           ids = [d?.cliSessionId, d?.lastAssistantCliSessionId, ...prior].filter((id): id is string => typeof id === 'string' && id.length > 0)
-          if (f.mtimeMs > 0) desktopSessionCache.set(filePath, { size: f.size, mtimeMs: f.mtimeMs, ids })
+          localId = str(d?.sessionId) ?? (f.name.startsWith('local_') ? f.name.slice(0, -'.json'.length) : undefined)
+          // 标题与归档状态只记在当前的日志 id 上；回退前的旧 id 是另一份日志，保留它自己的标题
+          mainIds = [d?.cliSessionId, d?.lastAssistantCliSessionId].filter((id): id is string => typeof id === 'string' && id.length > 0)
+          title = str(d?.title)
+          isArchived = d?.isArchived === true ? true : undefined
+          if (f.mtimeMs > 0) desktopSessionCache.set(filePath, { size: f.size, mtimeMs: f.mtimeMs, ids, localId, title, isArchived, mainIds })
         }
-        for (const id of ids) bySession[id] = acct.name
+        for (const id of ids) {
+          bySession[id] = acct.name
+          if (localId) desktopBySession[id] = localId
+        }
+        for (const id of mainIds) if (title !== undefined || isArchived) desktopMeta[id] = { title, isArchived }
       }
     }
   }
@@ -368,165 +381,7 @@ export async function loadAccounts(
     const name = str(v)
     if (name) labels[id] = { ...labels[id], email: name }
   }
-  return { bySession, labels, current }
-}
-
-// ---------- 单个会话的上下文详情（双击会话时按需读取） ----------
-
-const DETAIL_POINTS = 400
-const FILE_TOOLS = new Set(['Read', 'NotebookRead', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
-const WRITE_FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
-/** 每次开始加载加一；加载途中发现它变了就放弃（用户又双击了别的会话或返回总览） */
-let detailToken = 0
-
-/** 返回总览时取消正在进行的后台详情读取 */
-export function cancelSessionDetail(): void {
-  detailToken += 1
-}
-
-/** 把逐请求序列均匀抽样到至多 n 个点，保留首尾 */
-export function downsample<T>(list: T[], n: number): T[] {
-  if (list.length <= n) return list
-  const out: T[] = []
-  for (let i = 0; i < n; i++) out.push(list[Math.round((i * (list.length - 1)) / (n - 1))] as T)
-  return out
-}
-
-/**
- * 从主会话日志还原上下文详情：逐请求的上下文大小、压缩次数、模型、工具、文件与命令。
- * 按 4 MiB 分块读，每块更新一次进度。
- */
-export async function loadSessionDetail($: EngineInterface, id: string, file: string): Promise<void> {
-  const token = ++detailToken
-  const size = await $.fs
-    .stat(file)
-    .then(s => s.size)
-    .catch(() => 0)
-  const base: SessionDetail = {
-    id,
-    status: 'loading',
-    doneBytes: 0,
-    totalBytes: size,
-    requests: [],
-    requestCount: 0,
-    lastCtx: 0,
-    maxCtx: 0,
-    compactions: 0,
-    drops: [],
-    tools: {},
-    programs: {},
-    files: {},
-  }
-  await setDetail($, () => base)
-
-  const requests: DetailRequest[] = []
-  const models: Record<string, number> = {}
-  const tools: Record<string, number> = {}
-  const programs: Record<string, number> = {}
-  const files: Record<string, { r: number; w: number }> = {}
-  let lastReq: string | undefined
-  const onLine = (line: string) => {
-    if (!line.includes('"type":"assistant"')) return
-    const d = parse(line)
-    if (!d || d.type !== 'assistant') return
-    const msg = obj(d.message)
-    if (!msg) return
-    const usage = obj(msg.usage)
-    const model = str(msg.model) ?? 'unknown'
-    const req = str(d.requestId) ?? str(msg.id)
-    const t = str(d.timestamp)
-    const at = t ? Date.parse(t) : NaN
-    if (usage && model !== '<synthetic>' && req !== lastReq && !Number.isNaN(at)) {
-      lastReq = req
-      requests.push({
-        at,
-        ctx:
-          num(usage.input_tokens) + num(usage.cache_read_input_tokens) + num(usage.cache_creation_input_tokens),
-        out: num(usage.output_tokens),
-      })
-      addCount(models, model)
-    }
-    for (const raw of Array.isArray(msg.content) ? msg.content : []) {
-      const block = obj(raw)
-      if (!block || block.type !== 'tool_use') continue
-      const name = str(block.name) ?? 'unknown'
-      addCount(tools, name)
-      const input = obj(block.input)
-      if (name === 'Bash') {
-        const cmd = str(input?.command)
-        const prog = cmd ? programOf(cmd) : undefined
-        if (prog) addCount(programs, prog)
-      }
-      // NotebookEdit 的路径参数叫 notebook_path
-      const path = str(input?.file_path) ?? str(input?.notebook_path)
-      if (path && FILE_TOOLS.has(name)) {
-        const f = files[path] ?? { r: 0, w: 0 }
-        files[path] = WRITE_FILE_TOOLS.has(name) ? { r: f.r, w: f.w + 1 } : { r: f.r + 1, w: f.w }
-      }
-    }
-  }
-
-  try {
-    const decoder = new TextDecoder('utf-8')
-    let offset = 0
-    let skipping = false
-    while (offset < size) {
-      const length = Math.min(CHUNK, size - offset)
-      const got = await $.fs.read(file, { as: 'bytes', offset, length })
-      if (token !== detailToken) return
-      const bytes = fromBase64(got.base64)
-      if (bytes.length === 0) break
-      const lastNl = bytes.lastIndexOf(10)
-      if (lastNl < 0) {
-        if (bytes.length < CHUNK) break
-        skipping = true
-        offset += bytes.length
-        continue
-      }
-      const lines = decoder.decode(bytes.subarray(0, lastNl)).split('\n')
-      if (skipping) {
-        lines.shift()
-        skipping = false
-      }
-      for (const line of lines) onLine(line)
-      offset += lastNl + 1
-      await setDetail($, d => (d && d.id === id ? { ...d, doneBytes: offset } : d))
-    }
-    requests.sort((a, b) => a.at - b.at)
-    const drops = detectContextDrops(requests)
-    const done: SessionDetail = {
-      ...base,
-      status: 'ready',
-      doneBytes: size,
-      requests: downsample(requests, DETAIL_POINTS),
-      requestCount: requests.length,
-      model: Object.entries(models).sort((a, b) => b[1] - a[1])[0]?.[0],
-      lastCtx: requests[requests.length - 1]?.ctx ?? 0,
-      maxCtx: requests.reduce((m, r) => Math.max(m, r.ctx), 0),
-      compactions: drops.length,
-      drops,
-      tools,
-      programs,
-      files,
-    }
-    if (token === detailToken) await setDetail($, () => done)
-  } catch (err) {
-    if (token === detailToken) {
-      await setDetail($, d => (d ? { ...d, status: 'error' as const, error: String(err) } : d))
-    }
-  }
-}
-
-/** 扫描本机已安装的技能目录（~/.claude/skills 与 ~/.agents/skills），用于找出「已装但未用」的技能 */
-export async function loadInstalledSkills($: EngineInterface, claudeDir: string, home: string): Promise<string[]> {
-  const names = new Set<string>()
-  for (const dir of [`${claudeDir}/skills`, `${home}/.agents/skills`]) {
-    const entries = await $.fs.list(dir).catch(() => [])
-    for (const e of entries) {
-      if ((e.kind === 'dir' || e.isLink) && !e.name.startsWith('.')) names.add(e.name)
-    }
-  }
-  return [...names].sort()
+  return { bySession, desktopBySession, desktopMeta, labels, current }
 }
 
 let running = false
@@ -544,12 +399,8 @@ export async function runScan($: EngineInterface): Promise<void> {
     const tzMin = await localTzMinutes($)
     const targets = await listTargets($, root)
     const sessionId = await $.session.id().catch(() => undefined)
-    const [accounts, installedSkills] = await Promise.all([
-      loadAccounts($, home, sessionId, { claudeDir, appData }).catch(() => NO_ACCOUNTS),
-      loadInstalledSkills($, claudeDir, home).catch(() => [] as string[]),
-    ])
+    const accounts = await loadAccounts($, home, sessionId, { claudeDir, appData }).catch(() => NO_ACCOUNTS)
     await setAccounts($, () => accounts)
-    await setInstalledSkills($, () => installedSkills)
 
     // 读出缓存
     const cached = new Map<string, SessionAgg>()

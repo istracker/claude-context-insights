@@ -70,9 +70,10 @@ export function dailyAverage(series: DayPoint[]): number {
  * 每日成本：柱 + 日均虚线。今天的柱子实色，其余半透明。
  * 今天的金额和日均都放在标题旁，图内不标数字：窄屏或相邻柱较高时标签必然相撞。
  */
-export function dailySvg(series: DayPoint[], width = 520): string {
+/** height：并排时拉高以对齐右侧卡片，避免左卡下半部空着 */
+export function dailySvg(series: DayPoint[], width = 520, height = 180): string {
   const W = clampW(width, 240)
-  const H = 180
+  const H = Math.max(110, Math.round(height))
   if (series.length === 0) return svg(W, H, '')
   const left = 44
   const right = 16
@@ -146,7 +147,15 @@ export function hoursSvg(hours: Record<string, number>, width = 300): string {
 /** color 填 'track' 时用轨道底色（跟随深浅色） */
 export type Segment = { name: string; value: number; color: string; note?: string }
 
-let clipSeq = 0
+/** 按内容算一个稳定的短 id（FNV-1a）：同样的数据每次重绘生成完全相同的 SVG，宿主不会换图而闪烁 */
+function stableId(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36)
+}
 
 /** 一条圆角堆叠条，段间留 2px 缝 */
 export function stackSvg(segs: Segment[], width = 400): string {
@@ -169,7 +178,8 @@ export function stackSvg(segs: Segment[], width = 400): string {
       return r
     })
     .join('')
-  const cid = `c${++clipSeq}`
+  // clipPath id 由内容决定：数据不变时 SVG 字符串不变（避免滚动重绘时整图被替换而闪烁）；不同的条 id 不同，互不裁切
+  const cid = `c${stableId(`${W}|${body}`)}`
   return svg(W, H, `<clipPath id="${cid}"><rect width="${W}" height="${H}" rx="5"/></clipPath><g clip-path="url(#${cid})">${body}</g>`)
 }
 
@@ -213,91 +223,50 @@ export function donutSvg(
   return svg(S, S, track + arcs + label)
 }
 
-export type HeatDay = { usd: number; tokens: number; sessions: number }
-
-/** 活跃度日历热力图：按周排布（周一到周日），按 token 平方根映射深浅，悬停看当天明细 */
-export function heatmapSvg(byDay: Record<string, HeatDay>, today: string, width = 340): string {
-  const W = clampW(width, 200)
-  const left = 20
-  const top = 18
-  const cell = 11
-  const gap = 3
-  const step = cell + gap
-  const H = top + 7 * step - gap + 4
-  const weeks = Math.max(8, Math.min(26, Math.floor((W - left) / step)))
-  const todayMs = Date.parse(today + 'T00:00:00Z')
-  if (Number.isNaN(todayMs)) return svg(W, H, '')
-  // 周一=0 .. 周日=6
-  const todayDow = (new Date(todayMs).getUTCDay() + 6) % 7
-  const startMs = todayMs - ((weeks - 1) * 7 + todayDow) * 86_400_000
-
-  type Cell = { col: number; row: number; day: string; info?: HeatDay }
-  const cells: Cell[] = []
-  let maxTok = 0
-  for (let col = 0; col < weeks; col++) {
-    for (let row = 0; row < 7; row++) {
-      const ms = startMs + (col * 7 + row) * 86_400_000
-      if (ms > todayMs) continue
-      const day = new Date(ms).toISOString().slice(0, 10)
-      const info = byDay[day]
-      if (info && info.tokens > maxTok) maxTok = info.tokens
-      cells.push({ col, row, day, info })
-    }
-  }
-
-  // 周内标签（一 / 三 / 五）
-  const rowLabels = [
-    [0, '一'],
-    [2, '三'],
-    [4, '五'],
-  ]
-    .map(([r, text]) => `<text x="0" y="${top + (r as number) * step + 9}" style="font-size:10px">${text}</text>`)
-    .join('')
-
-  // 顶部月份标签：每当新月份首次出现在某周，且距上一个标签至少 28px 时标出
-  let lastMonth = -1
-  let lastLabelX = -100
-  const monthLabels: string[] = []
-  for (let col = 0; col < weeks; col++) {
-    const ms = startMs + col * 7 * 86_400_000
-    const m = new Date(ms).getUTCMonth() + 1
-    const x = left + col * step
-    if (m !== lastMonth && x - lastLabelX >= 28) {
-      monthLabels.push(`<text x="${x}" y="11" style="font-size:10px">${m}月</text>`)
-      lastLabelX = x
-    }
-    lastMonth = m
-  }
-
-  const rects = cells
-    .map(c => {
-      const x = left + c.col * step
-      const y = top + c.row * step
-      const tok = c.info?.tokens ?? 0
-      const tip = c.info
-        ? `${c.day}\n${fmtUsd(c.info.usd)} · ${c.info.sessions} 个会话 · ${fmtTokens(c.info.tokens)} token`
-        : `${c.day}\n无活动`
-      if (tok <= 0 || maxTok <= 0) {
-        return `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" class="track"><title>${escapeXml(tip)}</title></rect>`
-      }
-      const ratio = Math.sqrt(tok / maxTok)
-      const op = ratio <= 0.25 ? 0.3 : ratio <= 0.5 ? 0.52 : ratio <= 0.75 ? 0.76 : 1
-      return `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" fill="${ACCENT}" opacity="${op}"><title>${escapeXml(tip)}</title></rect>`
-    })
-    .join('')
-
-  const actualW = left + weeks * step - gap + 2
-  return svg(actualW, H, rowLabels + monthLabels.join('') + rects)
+/**
+ * 一个额度窗口：上行左边窗口名、右边「重置时刻  百分比」，下行进度条。
+ * 文字和进度条画在同一张图里，百分比总是落在进度条右端正上方，不受面板宽度估算误差影响。
+ */
+export function quotaSvg(
+  name: string,
+  reset: string,
+  percent: string,
+  fraction: number,
+  color: string,
+  width = 400,
+  percentColor?: string,
+  isStale = false,
+): string {
+  const W = clampW(width, 160)
+  const barY = 24
+  const barH = 6
+  const H = barY + barH
+  const f = Math.min(1, Math.max(0, fraction))
+  // 非当前账号的旧读数：只把进度条调淡，文字保持清楚
+  const fill = f > 0 ? `<rect y="${barY}" width="${Math.max(barH, f * W).toFixed(1)}" height="${barH}" rx="3" fill="${color}"${isStale ? ' opacity="0.55"' : ''}/>` : ''
+  // 中文按 13px、其余按 7.5px 估算百分比文字宽度，重置时刻紧贴在它左边
+  const pctW = Math.max(28, [...percent].reduce((a, ch) => a + (/[\u4e00-\u9fff]/.test(ch) ? 13 : 7.5), 0))
+  return svg(
+    W,
+    H,
+    `<text x="0" y="14" class="ink" style="font-size:13px">${escapeXml(name)}</text>` +
+      `<text x="${W - pctW - 8}" y="14" text-anchor="end" style="font-size:13px">${escapeXml(reset)}</text>` +
+      `<text x="${W}" y="14" text-anchor="end" ${percentColor ? `fill="${percentColor}"` : 'class="ink"'} style="font-size:13px">${escapeXml(percent)}</text>` +
+      `<rect y="${barY}" width="${W}" height="${barH}" rx="3" class="track"/>${fill}`,
+  )
 }
 
 /** 排行行下的细进度线：轨道底色 + 实色部分（单行大量渲染，用精简样式） */
 const LINE_STYLE = `<style>:root{--track:#EDEDED}@media (prefers-color-scheme:dark){:root{--track:#363636}}.track{fill:var(--track)}</style>`
 
-export function lineSvg(fraction: number, width: number, color: string): string {
+export function lineSvg(fraction: number, width: number, color: string, height = 4): string {
   const W = clampW(width, 60)
-  const H = 4
-  const w = Math.max(2, Math.min(1, Math.max(0, fraction)) * W)
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;height:auto">${LINE_STYLE}<rect width="${W}" height="${H}" rx="2" class="track"/><rect width="${w.toFixed(1)}" height="${H}" rx="2" fill="${color}"/></svg>`
+  const H = Math.max(2, Math.round(height))
+  const f = Math.min(1, Math.max(0, fraction))
+  const r = H / 2
+  // 为 0 时只画轨道，不留色点
+  const fill = f > 0 ? `<rect width="${Math.max(H, f * W).toFixed(1)}" height="${H}" rx="${r}" fill="${color}"/>` : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;height:auto">${LINE_STYLE}<rect width="${W}" height="${H}" rx="${r}" class="track"/>${fill}</svg>`
 }
 
 /**
@@ -342,4 +311,68 @@ export function contextTrendSvg(values: number[], window: number, compactAt: num
     H,
     `${grid}<polygon points="${area}" fill="${ACCENT}" opacity="0.1"/><polyline points="${pts}" fill="none" stroke="${ACCENT}" stroke-width="1.8" stroke-linejoin="round"/>${compact}<circle cx="${x(n - 1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="3.5" fill="${ACCENT}"/>${hits}`,
   )
+}
+
+/**
+ * 每日 token：细折线 + 浅色填充，日均画虚线。横轴只标首、中、尾三个日期，图内不标数字。
+ * 悬停每天的竖条看明细（token、提问、等价金额）。
+ */
+export function dailyTokenSvg(series: DayPoint[], width = 520, height = 120, showMoney = true): string {
+  const W = clampW(width, 240)
+  const H = Math.max(90, Math.round(height))
+  if (series.length === 0) return svg(W, H, '')
+  const top = 6
+  const bottom = 20
+  const plotH = H - top - bottom
+  const n = series.length
+  const max = Math.max(1, ...series.map(s => s.tokens)) * 1.08
+  const x = (i: number) => (n === 1 ? W / 2 : (i / (n - 1)) * W)
+  const y = (v: number) => top + plotH - (v / max) * plotH
+  const pts = series.map((s, i) => `${x(i).toFixed(1)},${y(s.tokens).toFixed(1)}`).join(' ')
+  const base = top + plotH
+  const area = `<polygon points="0,${base} ${pts} ${W},${base}" fill="${ACCENT}" opacity="0.12"/>`
+  const line = `<polyline points="${pts}" fill="none" stroke="${ACCENT}" stroke-width="1.5" stroke-linejoin="round"/>`
+  const avg = series.reduce((a, s) => a + s.tokens, 0) / n
+  const avgLine = avg > 0 ? `<line x1="0" x2="${W}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke="${GREY}" stroke-width="1" stroke-dasharray="3 3" opacity="0.8"/>` : ''
+  const axis = `<line class="grid" x1="0" x2="${W}" y1="${base}" y2="${base}" stroke-width="1"/>`
+  const label = (i: number, anchor: string) => {
+    const s = series[i]!
+    const text = i === n - 1 ? '今天' : s.day.slice(5).replace('-', '/')
+    return `<text x="${x(i).toFixed(1)}" y="${H - 4}" text-anchor="${anchor}">${text}</text>`
+  }
+  const labels = n > 2 ? label(0, 'start') + label(Math.floor((n - 1) / 2), 'middle') + label(n - 1, 'end') : label(n - 1, 'end')
+  const slot = W / n
+  const hits = series
+    .map((s, i) => {
+      const tip = `${s.day}\n${fmtTokens(s.tokens)} token · ${s.prompts} 次提问${showMoney ? ` · ≈ ${fmtUsd(s.usd)}` : ''}`
+      return `<rect x="${(x(i) - slot / 2).toFixed(1)}" y="${top}" width="${slot.toFixed(1)}" height="${plotH}" fill="transparent"><title>${escapeXml(tip)}</title></rect>`
+    })
+    .join('')
+  return svg(W, H, area + avgLine + axis + line + labels + hits)
+}
+
+/** 工具行中间的双条：上为 token 占比、下为次数占比（同色，次数那根淡一些） */
+export function dualBarSvg(tokenShare: number, countShare: number, color: string, width = 120): string {
+  const W = clampW(width, 40)
+  const bar = (f: number, yy: number, op: string) =>
+    `<rect y="${yy}" width="${W}" height="3" rx="1.5" class="track"/>` +
+    (f > 0 ? `<rect y="${yy}" width="${Math.max(2, Math.min(1, f) * W).toFixed(1)}" height="3" rx="1.5" fill="${color}"${op}/>` : '')
+  return svg(W, 8, bar(tokenShare, 0, '') + bar(countShare, 5, ' opacity="0.4"'))
+}
+
+/** 构成表上方的细分段条（与 /context 的用量条同风格）：4px 高，段间留 2px 缝 */
+export function thinStackSvg(segs: { value: number; color: string }[], width = 400): string {
+  const W = clampW(width, 80)
+  const total = segs.reduce((a, s) => a + Math.max(0, s.value), 0)
+  let x = 0
+  const body = segs
+    .filter(s => s.value > 0 && total > 0)
+    .map(s => {
+      const w = (s.value / total) * W
+      const el = `<rect x="${x.toFixed(1)}" width="${Math.max(1.5, w - 2).toFixed(1)}" height="4" rx="2" fill="${s.color}"/>`
+      x += w
+      return el
+    })
+    .join('')
+  return svg(W, 4, `<rect width="${W}" height="4" rx="2" class="track"/>${body}`)
 }
