@@ -151,6 +151,8 @@ export type InsightTab = 'overview' | 'sessions' | 'tools' | 'settings'
 
 /** 插件设置：跨会话保存在 $.store */
 export type InsightSettings = {
+  /** 新开会话时是否自动打开面板，默认关闭 */
+  autoOpen?: boolean
   /** 是否显示等价 API 金额，默认显示 */
   showMoney?: boolean
   /** 不统计的项目名 */

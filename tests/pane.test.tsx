@@ -148,3 +148,39 @@ test('关闭面板：/ctx close 与面板里的 ✕ 都调 ui.close', async ($, 
   expect(closed).toEqual(['cc-context-insights', 'cc-context-insights'])
   await ui.unmount()
 })
+
+test('新开会话默认不自动打开面板；在设置里开启后才会自动打开', async ($, on) => {
+  const store = new Map<string, unknown>()
+  const opened: string[] = []
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('command.register', () => ({ value: { command: 'ctx' } }))
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+  on('session.usage', () => ({ value: { ...USAGE, rateLimits: [] } }))
+  on('agent.list', () => ({ value: [] }))
+  on('clock.now', () => ({ value: 1000 }))
+  on('ui.log', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'cur' }))
+
+  // 默认关闭：session.start 不会调 ui.open
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(opened).toEqual([])
+
+  // 在插件设置里开启「新会话自动打开」后，下次新开会话自动打开面板
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'open-settings' })
+  await ui.press({ key: 'set-tg-auto-open' })
+  await ui.unmount()
+  expect((store.get('settings-1') as { autoOpen?: boolean })?.autoOpen).toBe(true)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(opened).toEqual(['cc-context-insights'])
+})

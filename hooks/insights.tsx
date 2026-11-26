@@ -1279,6 +1279,14 @@ export async function renderInsights($: EngineInterface, e: PaneInput): Promise<
 
           {group('显示')}
           {row(
+            'auto-open',
+            '新会话自动打开',
+            '开启后每次新开会话自动弹出面板',
+            toggle('auto-open', settings.autoOpen === true, () =>
+              saveSettings(v => ({ ...v, autoOpen: !(v.autoOpen === true) })),
+            ),
+          )}
+          {row(
             'money',
             '显示金额',
             '关闭后隐藏所有「≈ $」等价成本',

@@ -21,6 +21,7 @@ import {
   getFocus,
   getLimits,
   getScan,
+  getSettings,
   getSnapshot,
   getSteps,
   getStepTotals,
@@ -223,9 +224,11 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    void $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS, rows: PANE_ROWS })
     void refresh($, 'summary')
     await startInsights($).catch(err => $.ui.log(`${PLUGIN}: 洞察启动失败 ${String(err)}`))
+    if ((await getSettings($)).autoOpen === true) {
+      void $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS, rows: PANE_ROWS })
+    }
     return started
   })
 
